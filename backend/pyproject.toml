@@ -1,0 +1,36 @@
+[project]
+name = "traceiq-backend"
+version = "0.1.0"
+description = "TraceIQ backend: AI model and LLM observability platform"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn>=0.30,<1.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.7,<3.0",
+    "sqlalchemy>=2.0,<2.1",
+    "psycopg[binary]>=3.2,<4.0",
+    "alembic>=1.13,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "httpx>=0.27,<1.0",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "db: requires a reachable PostgreSQL database (TRACEIQ_DATABASE_URL)",
+]

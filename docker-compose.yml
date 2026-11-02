@@ -1,0 +1,51 @@
+name: traceiq
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-traceiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-traceiq}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      target: runtime
+    environment:
+      TRACEIQ_ENV: ${TRACEIQ_ENV:-development}
+      TRACEIQ_LOG_LEVEL: ${TRACEIQ_LOG_LEVEL:-INFO}
+      TRACEIQ_CORS_ORIGINS: ${TRACEIQ_CORS_ORIGINS:-http://localhost:5173}
+      # Passed as separate parts; the backend builds the URL with SQLAlchemy URL.create,
+      # so credentials are never interpolated into a URL string.
+      TRACEIQ_DATABASE_HOST: db
+      TRACEIQ_DATABASE_PORT: "5432"
+      TRACEIQ_DATABASE_USER: ${POSTGRES_USER:-traceiq}
+      TRACEIQ_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TRACEIQ_DATABASE_NAME: ${POSTGRES_DB:-traceiq}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:
