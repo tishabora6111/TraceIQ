@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.database import get_session_factory
+from app.core.logging import describe_database_error, find_database_error
 from app.modules.jobs import repository
 from app.modules.jobs.errors import InvalidJobPayloadError, PermanentJobError, UnknownJobTypeError
 from app.modules.jobs.registry import JobContext, JobHandler, JobRegistry, default_registry, validate_payload
@@ -66,10 +67,20 @@ def compute_backoff_seconds(
 def format_error(exc: BaseException) -> str:
     """A safe, bounded description of ``exc`` for storage and logs.
 
-    Masks passwords in URLs, removes NUL characters (not storable in PostgreSQL text), and
-    truncates. Tracebacks are never stored.
+    Database errors, and any error caused by one, are reduced to safe metadata (driver error
+    class, SQLSTATE, constraint): PostgreSQL messages can contain row values, which
+    ``hide_parameters`` does not hide. Otherwise masks passwords in URLs, removes NUL characters
+    (not storable in PostgreSQL text), and truncates. Tracebacks are never stored.
     """
-    message = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    database_error = find_database_error(exc)
+    if database_error is not None:
+        # The outer message is dropped too: it may have been built from the database error.
+        return f"{type(exc).__name__}: {describe_database_error(database_error)}"
+    try:
+        text = str(exc)
+    except Exception:
+        text = "<exception str() failed>"
+    message = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
     message = _URL_CREDENTIALS.sub(r"\g<scheme>\g<user>:***@", message).replace("\x00", "")
     if len(message) > MAX_ERROR_LENGTH:
         message = message[: MAX_ERROR_LENGTH - len(_TRUNCATED)] + _TRUNCATED

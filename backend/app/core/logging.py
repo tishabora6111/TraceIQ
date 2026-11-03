@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sys
 import threading
 import traceback
@@ -65,14 +66,47 @@ def database_error_metadata(exc: BaseException) -> dict[str, str | None]:
 _STR_FAILED = "<exception str() failed>"
 
 
+_URL_CREDENTIALS = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<user>[^:@/\s]*):[^@/\s]*@")
+_MAX_CONNECTION_DETAIL_LENGTH = 300
+
+
+def _connection_error_detail(exc: BaseException) -> str | None:
+    """The first line of a client-side connection failure (e.g. "connection refused"), or None.
+
+    Only psycopg connection-level errors without an SQLSTATE qualify: they come from the client
+    library, not from the server, so they cannot quote row contents. URL credentials are masked.
+    """
+    driver_error = exc.orig if isinstance(exc, DBAPIError) else exc
+    if not isinstance(driver_error, psycopg.OperationalError | psycopg.InterfaceError):
+        return None
+    if getattr(driver_error, "sqlstate", None) is not None:
+        return None
+    try:
+        first_line = str(driver_error).strip().splitlines()[0] if str(driver_error).strip() else ""
+    except Exception:
+        return None
+    return _URL_CREDENTIALS.sub(r"\g<scheme>\g<user>:***@", first_line)[:_MAX_CONNECTION_DETAIL_LENGTH] or None
+
+
+def describe_database_error(exc: BaseException) -> str:
+    """A database error as safe text: a redaction marker plus its metadata, never the server's message.
+
+    Client-side connection failures keep their first line, which operators need to diagnose an
+    unreachable database.
+    """
+    fields = database_error_metadata(exc)
+    text = "<database error message redacted> " + " ".join(f"{key}={value}" for key, value in fields.items())
+    detail = _connection_error_detail(exc)
+    return f"{text} connection_error={detail!r}" if detail else text
+
+
 def _safe_exception_message(exc: BaseException) -> str:
     if not is_database_error(exc):
         try:
             return str(exc)
         except Exception:
             return _STR_FAILED
-    fields = database_error_metadata(exc)
-    return "<database error message redacted> " + " ".join(f"{key}={value}" for key, value in fields.items())
+    return describe_database_error(exc)
 
 
 _CAUSE_LINK = "The above exception was the direct cause of the following exception:"

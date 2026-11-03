@@ -93,8 +93,10 @@ class Settings(BaseSettings):
     auth_registration_enabled: bool | None = None
     # Process-wide cap on simultaneous Argon2id operations (each uses 64 MiB). Read once per process.
     auth_max_concurrent_hashes: int = Field(4, ge=1, le=64)
+    # How long a request waits for a hashing slot before failing with 503 (overload protection).
+    auth_hash_wait_timeout_seconds: float = Field(10.0, gt=0, le=120)
 
-    @field_validator("jwt_secret", "csrf_secret", "auth_cookie_domain", mode="before")
+    @field_validator("jwt_secret", "csrf_secret", "auth_cookie_domain", "auth_registration_enabled", mode="before")
     @classmethod
     def _empty_is_unset(cls, value: object) -> object:
         return None if value == "" else value

@@ -73,6 +73,14 @@ def registry(calls: list[JobContext]) -> JobRegistry:
     def bad_write(context: JobContext, payload: MarkerPayload) -> None:
         context.session.execute(text("INSERT INTO test_job_markers (marker) VALUES (NULL)"))
 
+    @registry.handler("tests.leaky_database_error", payload=MarkerPayload)
+    def leaky_database_error(context: JobContext, payload: MarkerPayload) -> None:
+        # A check violation: PostgreSQL's DETAIL line echoes the whole row, including the marker.
+        context.session.execute(
+            text("INSERT INTO users (id, email, password_hash) VALUES (gen_random_uuid(), :email, :hash)"),
+            {"email": f"UPPER-{payload.marker}@example.com", "hash": f"hash-{payload.marker}"},
+        )
+
     @registry.handler("tests.leaky_error", payload=MarkerPayload)
     def leaky_error(context: JobContext, payload: MarkerPayload) -> None:
         raise RuntimeError(f"could not connect to {SECRET_URL}\x00" + "x" * 5000)
@@ -323,6 +331,67 @@ def test_error_is_sanitized_and_truncated(registry: JobRegistry, caplog: pytest.
 )
 def test_format_error(exc: Exception, expected: str) -> None:
     assert format_error(exc) == expected
+
+
+DB_MARKER = "job-row-leak-marker-5d1a"
+
+
+def test_database_error_rows_never_reach_last_error_or_logs(
+    registry: JobRegistry, caplog: pytest.LogCaptureFixture
+) -> None:
+    from app.core.logging import JsonFormatter
+
+    job_id = enqueue_committed(registry, "tests.leaky_database_error", {"marker": DB_MARKER})
+
+    with caplog.at_level(logging.DEBUG):
+        result = run_next_job("w1", registry=registry)
+
+    assert result is not None and result[1] is JobOutcome.RETRY_SCHEDULED
+    error = job_row(job_id).last_error
+    assert DB_MARKER not in error and "Failing row" not in error
+    assert error == (
+        "IntegrityError: <database error message redacted>"
+        " db_error_type=CheckViolation sqlstate=23514 constraint=ck_users_email_normalized"
+    )
+    # Production log output (the JSON formatter) carries no row values, including the DEBUG
+    # record's traceback. (pytest's own formatter, caplog.text, is not used in production.)
+    assert caplog.records
+    for record in caplog.records:
+        assert DB_MARKER not in JsonFormatter().format(record)
+        if record.levelno > logging.DEBUG:
+            assert DB_MARKER not in record.getMessage()
+            assert DB_MARKER not in str(getattr(record, "error", ""))
+
+
+def _chained_database_error() -> BaseException:
+    import psycopg
+    from sqlalchemy.exc import IntegrityError
+
+    orig = psycopg.errors.CheckViolation(f"violates\nDETAIL:  Failing row contains ({DB_MARKER}).")
+    try:
+        try:
+            raise IntegrityError("INSERT ...", {}, orig)
+        except IntegrityError as exc:
+            raise RuntimeError(f"save failed: {exc}") from exc
+    except RuntimeError as outer:
+        return outer
+
+
+def test_format_error_redacts_errors_caused_by_database_errors() -> None:
+    message = format_error(_chained_database_error())
+
+    assert DB_MARKER not in message
+    assert message == (
+        "RuntimeError: <database error message redacted> db_error_type=CheckViolation sqlstate=23514 constraint=None"
+    )
+
+
+def test_format_error_survives_a_broken_str() -> None:
+    class Broken(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("str failed")
+
+    assert format_error(Broken()) == "Broken: <exception str() failed>"
 
 
 def test_format_error_truncates() -> None:

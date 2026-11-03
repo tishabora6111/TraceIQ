@@ -399,6 +399,30 @@ def test_max_concurrent_hashes_rejects_out_of_range_values(limit: int) -> None:
 
 
 @pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize(("env", "enabled"), [("development", True), ("production", False)])
+def test_empty_registration_override_means_environment_default(
+    monkeypatch: pytest.MonkeyPatch, env: str, enabled: bool
+) -> None:
+    """Docker Compose passes unset variables as empty strings."""
+    monkeypatch.setenv("TRACEIQ_AUTH_REGISTRATION_ENABLED", "")
+
+    settings = make_settings(env=env)
+
+    assert settings.auth_registration_enabled is None
+    assert settings.registration_enabled is enabled
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_hash_wait_timeout_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert make_settings().auth_hash_wait_timeout_seconds == 10.0
+    monkeypatch.setenv("TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS", "2.5")
+    assert make_settings().auth_hash_wait_timeout_seconds == 2.5
+    for invalid in (0, -1, 121):
+        with pytest.raises(ValidationError, match="auth_hash_wait_timeout_seconds"):
+            make_settings(auth_hash_wait_timeout_seconds=invalid)
+
+
+@pytest.mark.usefixtures("_no_auth_env")
 def test_max_concurrent_hashes_out_of_range_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRACEIQ_AUTH_MAX_CONCURRENT_HASHES", "65")
 

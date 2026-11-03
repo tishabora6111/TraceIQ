@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.core.config import Settings, get_settings
+from app.core.config import AuthConfigurationError, Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.modules.auth.api import router as auth_router
@@ -21,6 +21,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
     settings.validate_auth_secrets()
+    # Also enforced when settings are loaded; repeated for Settings objects built without validation.
+    if settings.env == "production" and not settings.auth_cookie_secure:
+        raise AuthConfigurationError("TRACEIQ_AUTH_COOKIE_SECURE must be true in production")
     logger = logging.getLogger(__name__)
     if not settings.cors_origins:
         logger.warning(

@@ -62,14 +62,20 @@ def _hashing_semaphore() -> threading.BoundedSemaphore:
     return threading.BoundedSemaphore(get_settings().auth_max_concurrent_hashes)
 
 
+class PasswordHashingBusyError(Exception):
+    """No hashing slot became free within ``auth_hash_wait_timeout_seconds`` (the server is overloaded)."""
+
+
 @contextmanager
 def _hashing_slot() -> Iterator[None]:
     """Hold one hashing slot. Every hash and verification, real or dummy, runs inside exactly one.
 
+    Waits at most ``auth_hash_wait_timeout_seconds``, then raises ``PasswordHashingBusyError``.
     Never nest: the functions below call only the unguarded helpers while holding a slot.
     """
     semaphore = _hashing_semaphore()
-    semaphore.acquire()
+    if not semaphore.acquire(timeout=get_settings().auth_hash_wait_timeout_seconds):
+        raise PasswordHashingBusyError("No password hashing capacity available")
     try:
         yield
     finally:
@@ -195,6 +201,9 @@ def decode_access_token(token: str, *, settings: Settings) -> AccessTokenClaims:
             options={"require": _REQUIRED_CLAIMS, "verify_signature": True},
         )
         if payload.get("typ") != ACCESS_TOKEN_TYPE:
+            raise InvalidTokenError("Invalid access token")
+        # uuid.UUID() raises AttributeError (not ValueError) for non-strings; check types first.
+        if not isinstance(payload["sub"], str) or not isinstance(payload["sid"], str):
             raise InvalidTokenError("Invalid access token")
         return AccessTokenClaims(
             user_id=uuid.UUID(payload["sub"]),

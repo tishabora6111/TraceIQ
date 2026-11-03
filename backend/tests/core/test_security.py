@@ -325,6 +325,11 @@ def test_missing_required_claim_is_rejected(settings: Settings, claim: str) -> N
         {"sub": "not-a-uuid"},
         {"sid": "not-a-uuid"},
         {"sub": 42},
+        # Non-string session ids: uuid.UUID() would raise AttributeError, not ValueError.
+        {"sid": 42},
+        {"sid": ["x"]},
+        {"sid": {"a": 1}},
+        {"sid": True},
     ],
 )
 def test_wrong_claim_values_are_rejected(settings: Settings, overrides: dict[str, Any]) -> None:
@@ -725,6 +730,34 @@ def test_default_semaphore_uses_the_configured_limit() -> None:
             semaphore.release()
     finally:
         security._hashing_semaphore.cache_clear()
+
+
+def test_waiting_for_a_slot_times_out(counting_hasher: _CountingHasher, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = security.get_settings().model_copy(
+        update={"auth_max_concurrent_hashes": 1, "auth_hash_wait_timeout_seconds": 0.05}
+    )
+    monkeypatch.setattr(security, "get_settings", lambda: settings)
+    security._hashing_semaphore.cache_clear()
+    semaphore = security._hashing_semaphore()
+    assert semaphore.acquire(blocking=False)  # another request holds the only slot
+    try:
+        for call in (
+            lambda: security.hash_password(PASSWORD),
+            lambda: security.verify_password(PASSWORD, "$argon2id$stored"),
+            lambda: security.verify_dummy_password(PASSWORD),
+        ):
+            started = time.perf_counter()
+            with pytest.raises(security.PasswordHashingBusyError):
+                call()
+            assert time.perf_counter() - started < 2
+    finally:
+        semaphore.release()
+
+    assert counting_hasher.calls == 0
+    # Once the slot is free, hashing works again and nothing was leaked by the timeouts.
+    security.hash_password(PASSWORD)
+    assert [semaphore.acquire(blocking=False), semaphore.acquire(blocking=False)] == [True, False]
+    semaphore.release()
 
 
 def test_real_hashing_still_works_under_the_bound() -> None:

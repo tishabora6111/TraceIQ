@@ -38,3 +38,14 @@ def set_session_cookies(
     }
     response.set_cookie(REFRESH_COOKIE_NAME, refresh_token, path=REFRESH_COOKIE_PATH, httponly=True, **common)
     response.set_cookie(CSRF_COOKIE_NAME, csrf_token, path=CSRF_COOKIE_PATH, httponly=False, **common)
+
+
+def clear_session_cookies(response: Response, *, settings: Settings) -> None:
+    """Expire both cookies. Name, path and domain must match how they were set, or browsers keep them."""
+    common = {
+        "domain": settings.auth_cookie_domain,
+        "secure": settings.auth_cookie_secure,
+        "samesite": settings.auth_cookie_samesite,
+    }
+    response.delete_cookie(REFRESH_COOKIE_NAME, path=REFRESH_COOKIE_PATH, httponly=True, **common)
+    response.delete_cookie(CSRF_COOKIE_NAME, path=CSRF_COOKIE_PATH, httponly=False, **common)

@@ -136,7 +136,8 @@ def test_formatted_database_error_hides_parameters_but_keeps_diagnostics() -> No
     message = format_error(_database_error_with_sensitive_parameter())
 
     assert SENSITIVE_VALUE not in message
-    # Still useful: exception type, the database's message, and the SQL text.
-    assert message.startswith("DataError: (psycopg.errors.DivisionByZero) division by zero")
-    assert "[SQL: SELECT %(value)s WHERE 1 / 0 = 1]" in message
-    assert "[SQL parameters hidden due to hide_parameters=True]" in message
+    # Database messages can embed row values, so only safe diagnostics remain: the exception
+    # type, the driver error class and the SQLSTATE.
+    assert message == (
+        "DataError: <database error message redacted> db_error_type=DivisionByZero sqlstate=22012 constraint=None"
+    )

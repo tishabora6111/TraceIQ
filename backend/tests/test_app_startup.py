@@ -37,6 +37,20 @@ def test_create_app_rejects_invalid_secrets(settings: Settings, overrides: dict[
         assert secret not in str(excinfo.value)
 
 
+def test_create_app_rejects_insecure_cookies_in_production(settings: Settings) -> None:
+    """model_copy() skips the settings validator; create_app() checks again."""
+    from app.main import create_app
+
+    with pytest.raises(AuthConfigurationError, match="TRACEIQ_AUTH_COOKIE_SECURE must be true in production"):
+        create_app(_settings(settings, env="production", auth_cookie_secure=False))
+
+
+def test_create_app_allows_insecure_cookies_outside_production(settings: Settings) -> None:
+    from app.main import create_app
+
+    create_app(_settings(settings, env="development", auth_cookie_secure=False))
+
+
 def test_create_app_accepts_valid_secrets(settings: Settings) -> None:
     from app.main import create_app
 

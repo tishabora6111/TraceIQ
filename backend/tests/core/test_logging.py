@@ -75,6 +75,50 @@ def test_database_errors_are_recognized() -> None:
     assert find_database_error(RuntimeError("x")) is None
 
 
+def test_connection_failures_keep_their_first_line() -> None:
+    """Client-side connection errors carry no row data and are needed to diagnose outages."""
+    from app.core.logging import describe_database_error
+
+    error = psycopg.OperationalError(
+        'connection failed: connection to server at "db" (10.0.0.5), port 5432 failed: Connection refused\n'
+        "\tIs the server running on that host and accepting TCP/IP connections?"
+    )
+    wrapped = IntegrityError("SELECT 1", {}, error)
+
+    for exc in (error, wrapped):
+        text = describe_database_error(exc)
+        assert text.startswith("<database error message redacted> db_error_type=OperationalError sqlstate=None")
+        assert "Connection refused" in text
+        assert "Is the server running" not in text  # first line only
+
+
+def test_connection_failure_urls_are_masked_and_bounded() -> None:
+    from app.core.logging import describe_database_error
+
+    text = describe_database_error(psycopg.OperationalError("cannot reach postgresql://app:hunter2@db/x " + "y" * 1000))
+
+    assert "hunter2" not in text
+    assert "postgresql://app:***@db/x" in text
+    assert len(text) < 500
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        psycopg.errors.CheckViolation(DRIVER_MESSAGE),  # server error with SQLSTATE
+        psycopg.errors.AdminShutdown(f"terminating connection\nDETAIL: {FAKE_EMAIL}"),  # OperationalError + SQLSTATE
+        psycopg.DataError(f"bad value {FAKE_EMAIL}"),  # not a connection error
+    ],
+)
+def test_server_and_data_errors_keep_no_message(error: psycopg.Error) -> None:
+    from app.core.logging import describe_database_error
+
+    text = describe_database_error(error)
+
+    _assert_no_leak(text)
+    assert "connection_error" not in text
+
+
 def test_metadata_contains_only_safe_fields() -> None:
     metadata = database_error_metadata(_wrapped_error())
 

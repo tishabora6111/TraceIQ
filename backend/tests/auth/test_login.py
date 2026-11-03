@@ -341,6 +341,51 @@ def test_login_logs_contain_no_credentials_or_tokens(
     assert "Login succeeded" in messages and messages.count("Login failed") == 2
 
 
+@pytest.mark.parametrize("email", ["user@example.com", "nobody@example.com"], ids=["known", "unknown"])
+def test_hashing_overload_returns_503_for_every_account(
+    client: TestClient, create_user: CreateUser, monkeypatch: pytest.MonkeyPatch, email: str
+) -> None:
+    import threading
+
+    from app.core import security
+
+    create_user()
+    busy = threading.BoundedSemaphore(1)
+    busy.acquire()  # every slot is taken
+    monkeypatch.setattr(security, "_hashing_semaphore", lambda: busy)
+    fast_timeout = security.get_settings().model_copy(update={"auth_hash_wait_timeout_seconds": 0.05})
+    monkeypatch.setattr(security, "get_settings", lambda: fast_timeout)
+
+    response = _login(client, email=email)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {"code": "authentication_busy", "message": "Authentication is temporarily busy. Retry shortly."}
+    }
+    assert response.headers["retry-after"] == "5"
+    assert "set-cookie" not in response.headers
+    assert _tokens() == []
+
+
+def test_hashing_overload_during_registration_returns_503(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    from app.core import security
+
+    busy = threading.BoundedSemaphore(1)
+    busy.acquire()
+    monkeypatch.setattr(security, "_hashing_semaphore", lambda: busy)
+    fast_timeout = security.get_settings().model_copy(update={"auth_hash_wait_timeout_seconds": 0.05})
+    monkeypatch.setattr(security, "get_settings", lambda: fast_timeout)
+
+    response = client.post("/api/v1/auth/register", json={"email": "new@example.com", "password": PASSWORD})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "authentication_busy"
+    with get_session_factory()() as session:
+        assert session.scalar(select(func.count()).select_from(User)) == 0
+
+
 def test_failed_logins_create_no_sessions(client: TestClient, create_user: CreateUser) -> None:
     create_user()
 

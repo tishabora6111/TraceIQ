@@ -9,12 +9,13 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.core.database import get_session_factory
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, generate_opaque_token, hash_opaque_token
 from app.modules.auth import repository, service
 from app.modules.auth.errors import (
     EmailAlreadyRegisteredError,
     InvalidCredentialsError,
     InvalidPasswordError,
+    NotAuthenticatedError,
     RegistrationDisabledError,
 )
 from app.modules.auth.models import RefreshToken, User
@@ -272,3 +273,118 @@ def test_register_domain_errors_roll_back(settings: Settings, create_user: Creat
         with pytest.raises((EmailAlreadyRegisteredError, InvalidPasswordError)):
             service.register_user(session, email=email, password=password, settings=settings)
         assert not session.in_transaction()
+
+
+# --- Authenticated user -----------------------------------------------------------------------
+
+
+def _logged_in(settings: Settings, create_user: CreateUser, now: datetime | None = None) -> service.LoginResult:
+    create_user()
+    with get_session_factory()() as session:
+        return service.login(session, email="user@example.com", password=PASSWORD, settings=settings, now=now)
+
+
+def test_get_authenticated_user_returns_the_user(settings: Settings, create_user: CreateUser) -> None:
+    result = _logged_in(settings, create_user)
+
+    with get_session_factory()() as session:
+        user = service.get_authenticated_user(session, user_id=result.user.id, session_id=result.session_id)
+
+    assert user.id == result.user.id
+    assert user.email == "user@example.com"
+
+
+def test_get_authenticated_user_is_read_only(settings: Settings, create_user: CreateUser) -> None:
+    """It never commits or rolls back: a caller's pending work in the same session is untouched."""
+    result = _logged_in(settings, create_user)
+
+    with get_session_factory()() as session:
+        pending = User(email="pending@example.com", password_hash="$argon2id$pending")
+        session.add(pending)
+        service.get_authenticated_user(session, user_id=result.user.id, session_id=result.session_id)
+        assert session.in_transaction()
+        assert pending in session.new
+        session.rollback()
+
+
+def test_get_authenticated_user_failure_does_not_roll_back_the_caller(settings: Settings, create_user: CreateUser) -> None:
+    create_user()
+
+    with get_session_factory()() as session:
+        pending = User(email="pending@example.com", password_hash="$argon2id$pending")
+        session.add(pending)
+        with pytest.raises(NotAuthenticatedError):
+            service.get_authenticated_user(session, user_id=uuid.uuid4(), session_id=uuid.uuid4())
+        assert pending in session.new
+        session.rollback()
+
+
+@pytest.mark.parametrize(
+    ("offset", "authenticated"),
+    [(timedelta(days=7) - timedelta(seconds=1), True), (timedelta(days=7), False), (timedelta(days=8), False)],
+    ids=["before-expiry", "at-expiry", "after-expiry"],
+)
+def test_session_expiry_boundary(
+    settings: Settings, create_user: CreateUser, offset: timedelta, authenticated: bool
+) -> None:
+    login_time = datetime.now(UTC).replace(microsecond=0)
+    result = _logged_in(settings, create_user, now=login_time)
+
+    with get_session_factory()() as session:
+        call = lambda: service.get_authenticated_user(  # noqa: E731
+            session, user_id=result.user.id, session_id=result.session_id, now=login_time + offset
+        )
+        if authenticated:
+            assert call().id == result.user.id
+        else:
+            with pytest.raises(NotAuthenticatedError):
+                call()
+
+
+def test_one_active_token_keeps_the_family_active(settings: Settings, create_user: CreateUser) -> None:
+    result = _logged_in(settings, create_user)
+    now = datetime.now(UTC)
+
+    with get_session_factory()() as session:
+        assert repository.has_active_session(session, user_id=result.user.id, family_id=result.session_id, now=now)
+        session.add(
+            RefreshToken(
+                user_id=result.user.id,
+                family_id=result.session_id,
+                token_hash=hash_opaque_token(generate_opaque_token()),
+                expires_at=now + timedelta(days=7),
+                absolute_expires_at=now + timedelta(days=30),
+                revoked_at=now,
+                revocation_reason="logout",
+            )
+        )
+        session.commit()
+        # A revoked sibling does not end the session while another token is still active.
+        assert repository.has_active_session(session, user_id=result.user.id, family_id=result.session_id, now=now)
+        for token in session.scalars(select(RefreshToken).where(RefreshToken.revoked_at.is_(None))):
+            token.revoked_at, token.revocation_reason = now, "logout"
+        session.commit()
+        assert not repository.has_active_session(session, user_id=result.user.id, family_id=result.session_id, now=now)
+
+
+@pytest.mark.parametrize("problem", ["unknown_user", "inactive_user", "inactive_session"])
+def test_rejections_are_identical_and_logged_with_a_reason(
+    settings: Settings, create_user: CreateUser, caplog: pytest.LogCaptureFixture, problem: str
+) -> None:
+    result = _logged_in(settings, create_user)
+    user_id, session_id = result.user.id, result.session_id
+    if problem == "unknown_user":
+        user_id = uuid.uuid4()
+    elif problem == "inactive_user":
+        with get_session_factory()() as session:
+            session.get_one(User, user_id).is_active = False
+            session.commit()
+    else:
+        session_id = uuid.uuid4()
+
+    with get_session_factory()() as session, caplog.at_level("INFO"), pytest.raises(NotAuthenticatedError) as excinfo:
+        service.get_authenticated_user(session, user_id=user_id, session_id=session_id)
+
+    assert (excinfo.value.status_code, excinfo.value.message) == (401, "Not authenticated.")
+    [record] = [r for r in caplog.records if r.getMessage() == "Authentication rejected"]
+    assert record.reason == problem

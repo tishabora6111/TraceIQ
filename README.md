@@ -48,7 +48,39 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for components, module boundari
 
 ## Setup
 
-Setup instructions will be added with milestone **M1 – Foundation**. The planned local workflow is a single Docker Compose command that starts the API, worker, frontend, and PostgreSQL.
+Local development uses Docker Compose for the API, worker, frontend, and PostgreSQL. M1 – Foundation is in progress, so expect this to change.
+
+1. Copy `.env.example` to `.env`. Never commit `.env`.
+2. Set `POSTGRES_PASSWORD`.
+3. Set the two authentication secrets. Generate each one separately:
+   ```bash
+   python -c "import secrets; print(secrets.token_urlsafe(48))"
+   ```
+   Put one value in `TRACEIQ_JWT_SECRET` and a *different* value in `TRACEIQ_CSRF_SECRET`. The API refuses to start if either is missing, shorter than 32 bytes, a placeholder, or the same as the other. The worker does not need them.
+4. Start everything:
+   ```bash
+   docker compose up -d --build
+   ```
+   The one-off `migrate` service applies database migrations before `api` and `worker` start.
+
+### Authentication configuration
+All settings are in `.env.example` and are passed only to the `api` service.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `TRACEIQ_JWT_SECRET`, `TRACEIQ_CSRF_SECRET` | *(required)* | At least 32 random bytes each, and different from each other. Changing one signs everyone out. |
+| `TRACEIQ_CORS_ORIGINS` | `http://localhost:5173` | Browser origins allowed to call the API. Login, refresh, logout and registration also require the request's Origin to be listed. |
+| `TRACEIQ_AUTH_COOKIE_SECURE` | `true` | Must be `true` in production; the API refuses to start otherwise. Chrome and Firefox accept Secure cookies on `http://localhost`. Set `false` only for local HTTP development in browsers that don't. |
+| `TRACEIQ_AUTH_COOKIE_SAMESITE` | `lax` | Assumes the frontend and API are on the same site. |
+| `TRACEIQ_AUTH_COOKIE_DOMAIN` | *(empty)* | Empty means host-only cookies (recommended). |
+| `TRACEIQ_AUTH_REGISTRATION_ENABLED` | *(empty)* | Empty means enabled in development and disabled in production. |
+| `TRACEIQ_ACCESS_TOKEN_TTL_SECONDS` | `900` | Access-token lifetime (15 minutes). |
+| `TRACEIQ_REFRESH_TOKEN_TTL_SECONDS` | `604800` | Rolling refresh-token lifetime (7 days), renewed on each refresh. |
+| `TRACEIQ_REFRESH_TOKEN_ABSOLUTE_TTL_SECONDS` | `2592000` | A session ends 30 days after login, however often it is refreshed. |
+| `TRACEIQ_AUTH_MAX_CONCURRENT_HASHES` | `4` | Concurrent Argon2id operations per API process (1–64, 64 MiB each). |
+| `TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS` | `10` | How long a login waits for hashing capacity before returning 503. |
+
+The auth endpoints are under `/api/v1/auth`: `register`, `login`, `refresh`, `logout` and `me`. Details are in [docs/ARCHITECTURE.md §7](docs/ARCHITECTURE.md).
 
 ## Documentation
 
