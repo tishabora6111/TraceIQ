@@ -259,8 +259,8 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 ### 10.1 Platform
 | Table | Key columns |
 |---|---|
-| `users` | id, email (unique), password_hash, is_active, created_at, last_login_at |
-| `refresh_tokens` | id, user_id → users, family_id, token_hash, expires_at, revoked_at, replaced_by_id, created_at |
+| `users` | id (UUID, generated in Python), email (unique; stored trimmed and lower-cased, CHECK: no upper case or whitespace, contains `@` after a local part; max 320), password_hash (Argon2id, non-empty), is_active, created_at, updated_at, last_login_at |
+| `refresh_tokens` | id (UUID, generated in Python), user_id → users (`CASCADE` on delete), family_id (one per login session), token_hash (unique SHA-256 hex, CHECK 64 lower-case hex characters), expires_at (rolling), absolute_expires_at (fixed per family; CHECK `expires_at <= absolute_expires_at`), revoked_at, revocation_reason (rotated / reuse_detected / logout / revoked, where `revoked` covers account-wide and security-driven revocation such as revoking all sessions or a password change; set exactly when revoked_at is set), replaced_by_id → refresh_tokens (unique, `SET NULL` on delete, only on `rotated` tokens, never the token itself), created_at |
 | `projects` | id, name, description, retention_overrides JSONB (null = config defaults), created_at |
 | `project_members` | project_id → projects, user_id → users, role (owner / admin / member), created_at; PK (project_id, user_id) |
 | `api_keys` | id, project_id → projects, key_hash, prefix, revoked_at |
@@ -311,7 +311,7 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 
 ### 10.6 Indexing
 - Foreign keys indexed.
-- `traces (project_id, started_at)`, `spans (trace_id)`, `prediction_logs (model_version_id, timestamp)`, `users (email)` unique, `refresh_tokens (token_hash)` unique, `refresh_tokens (family_id)`.
+- `traces (project_id, started_at)`, `spans (trace_id)`, `prediction_logs (model_version_id, timestamp)`, `users (email)` unique, `refresh_tokens (token_hash)` unique, `refresh_tokens (family_id)`, `refresh_tokens (user_id)`, `refresh_tokens (replaced_by_id)` unique.
 - Jobs: `jobs (run_at, created_at) WHERE status = 'queued'` (claiming), `jobs (lease_expires_at) WHERE status = 'running'` (recovery), `jobs (type, status)`, `jobs (finished_at)`, and a partial unique index `jobs (dedupe_key) WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'running')` (active deduplication). `job_schedules (next_run_at) WHERE enabled` (due schedules).
 - `incidents (project_id, status, last_seen_at)`, `incidents (project_id, fingerprint)`, `incidents (resolved_at)`, `investigation_reports (project_id, updated_at)`, `investigation_report_items (report_id, kind)`, `investigation_report_revisions (report_id, revision)` unique.
 - A partial unique index on `project_members (project_id) WHERE role = 'owner'` enforces a single Owner.

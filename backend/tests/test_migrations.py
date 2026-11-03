@@ -14,13 +14,19 @@ from alembic.util import CommandError
 from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
+from app.core.database import Base
+from app.modules.auth import models as _auth_models  # noqa: F401
+from app.modules.jobs import models as _jobs_models  # noqa: F401
 from tests.conftest import ADMIN_URL, alembic_config, create_database, drop_database
 
 pytestmark = [pytest.mark.db, pytest.mark.usefixtures("database")]
 
 BASELINE = "0001_baseline"
 JOBS = "0002_jobs"
+AUTH = "0003_auth"
+HEAD = AUTH
 JOB_TABLES = {"jobs", "job_schedules"}
+AUTH_TABLES = {"users", "refresh_tokens"}
 
 
 @pytest.fixture(scope="module")
@@ -78,10 +84,28 @@ def test_upgrade_downgrade_upgrade_cycle(migration_engine: Engine) -> None:
         _check(migration_engine)
 
     _upgrade(migration_engine, "head")
-    assert _current_revision(migration_engine) == JOBS
-    assert JOB_TABLES <= _tables(migration_engine)
+    assert _current_revision(migration_engine) == HEAD
+    assert JOB_TABLES | AUTH_TABLES <= _tables(migration_engine)
 
     # Autogenerate finds no difference between the models and the migrated schema.
+    _check(migration_engine)
+
+
+def test_auth_downgrade_and_repeated_upgrade(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    assert _current_revision(migration_engine) == AUTH
+
+    # Downgrading auth removes only its tables; the jobs tables stay.
+    _downgrade(migration_engine, JOBS)
+    assert _current_revision(migration_engine) == JOBS
+    assert _tables(migration_engine) == {"alembic_version"} | JOB_TABLES
+
+    _upgrade(migration_engine, AUTH)
+    assert _tables(migration_engine) == {"alembic_version"} | JOB_TABLES | AUTH_TABLES
+
+    # Upgrading an up-to-date database is a no-op.
+    _upgrade(migration_engine, "head")
+    assert _current_revision(migration_engine) == AUTH
     _check(migration_engine)
 
 
@@ -241,3 +265,138 @@ def test_schedule_interval_must_be_positive(migration_engine: Engine) -> None:
                     " VALUES ('s', 'test.job', 0, now())"
                 )
             )
+
+
+# --- Auth schema -----------------------------------------------------------------------------
+
+
+def test_users_schema(migration_engine: Engine) -> None:
+    inspector = inspect(migration_engine)
+    columns = {column["name"]: column for column in inspector.get_columns("users")}
+
+    assert set(columns) == {
+        "id", "email", "password_hash", "is_active", "created_at", "updated_at", "last_login_at",
+    }  # fmt: skip
+    assert {name for name, column in columns.items() if column["nullable"]} == {"last_login_at"}
+    assert columns["id"]["default"] is None
+    assert columns["email"]["type"].length == 320
+    for timestamp in ("created_at", "updated_at", "last_login_at"):
+        assert columns[timestamp]["type"].timezone is True
+
+    assert inspector.get_pk_constraint("users")["name"] == "pk_users"
+    assert {(c["name"], tuple(c["column_names"])) for c in inspector.get_unique_constraints("users")} == {
+        ("uq_users_email", ("email",))
+    }
+    assert {c["name"] for c in inspector.get_check_constraints("users")} == {
+        "ck_users_email_normalized",
+        "ck_users_email_has_at",
+        "ck_users_password_hash_not_empty",
+    }
+
+
+def test_refresh_tokens_schema(migration_engine: Engine) -> None:
+    inspector = inspect(migration_engine)
+    columns = {column["name"]: column for column in inspector.get_columns("refresh_tokens")}
+
+    assert set(columns) == {
+        "id", "user_id", "family_id", "token_hash", "expires_at", "absolute_expires_at",
+        "revoked_at", "revocation_reason", "replaced_by_id", "created_at",
+    }  # fmt: skip
+    assert {name for name, column in columns.items() if column["nullable"]} == {
+        "revoked_at", "revocation_reason", "replaced_by_id",
+    }  # fmt: skip
+    assert columns["id"]["default"] is None
+    for timestamp in ("expires_at", "absolute_expires_at", "revoked_at", "created_at"):
+        assert columns[timestamp]["type"].timezone is True
+
+    foreign_keys = {
+        fk["name"]: (fk["constrained_columns"], fk["referred_table"], fk["options"].get("ondelete"))
+        for fk in inspector.get_foreign_keys("refresh_tokens")
+    }
+    assert foreign_keys == {
+        "fk_refresh_tokens_user_id_users": (["user_id"], "users", "CASCADE"),
+        "fk_refresh_tokens_replaced_by_id_refresh_tokens": (["replaced_by_id"], "refresh_tokens", "SET NULL"),
+    }
+    assert {(c["name"], tuple(c["column_names"])) for c in inspector.get_unique_constraints("refresh_tokens")} == {
+        ("uq_refresh_tokens_token_hash", ("token_hash",)),
+        ("uq_refresh_tokens_replaced_by_id", ("replaced_by_id",)),
+    }
+    assert {c["name"] for c in inspector.get_check_constraints("refresh_tokens")} == {
+        "ck_refresh_tokens_token_hash_format",
+        "ck_refresh_tokens_expiry_within_absolute",
+        "ck_refresh_tokens_revocation_reason",
+        "ck_refresh_tokens_revoked_iff_reason",
+        "ck_refresh_tokens_replaced_only_when_rotated",
+        "ck_refresh_tokens_not_replaced_by_self",
+    }
+
+
+def test_auth_indexes(migration_engine: Engine) -> None:
+    with migration_engine.connect() as connection:
+        index_defs = dict(
+            connection.execute(
+                text("SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('users', 'refresh_tokens')")
+            ).all()
+        )
+
+    assert set(index_defs) == {
+        "pk_users",
+        "uq_users_email",
+        "pk_refresh_tokens",
+        "uq_refresh_tokens_token_hash",
+        "uq_refresh_tokens_replaced_by_id",
+        "ix_refresh_tokens_user_id",
+        "ix_refresh_tokens_family_id",
+    }
+    assert index_defs["uq_users_email"].startswith("CREATE UNIQUE INDEX")
+    assert index_defs["uq_refresh_tokens_token_hash"].startswith("CREATE UNIQUE INDEX")
+    assert "(user_id)" in index_defs["ix_refresh_tokens_user_id"]
+    assert "(family_id)" in index_defs["ix_refresh_tokens_family_id"]
+
+
+# --- Models and migrations agree --------------------------------------------------------------
+
+_CONSTRAINT_DEFS = text(
+    "SELECT rel.relname, con.conname, pg_get_constraintdef(con.oid)"
+    " FROM pg_constraint con JOIN pg_class rel ON rel.oid = con.conrelid"
+    " JOIN pg_namespace ns ON ns.oid = rel.relnamespace"
+    " WHERE ns.nspname = 'public' AND rel.relname <> 'alembic_version'"
+)
+_INDEX_DEFS = text("SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'")
+
+
+def _schema_definitions(engine: Engine) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    with engine.connect() as connection:
+        constraints = {tuple(row) for row in connection.execute(_CONSTRAINT_DEFS)}
+        indexes = {tuple(row) for row in connection.execute(_INDEX_DEFS) if row[0] != "alembic_version"}
+    return constraints, indexes
+
+
+def test_migrated_constraints_and_indexes_match_the_models(migration_engine: Engine) -> None:
+    """`alembic check` ignores check-constraint bodies; compare the full definitions instead."""
+    _upgrade(migration_engine, "head")
+    name = f"{ADMIN_URL.database}_metadata_test"
+    engine = create_engine(create_database(name, recreate=True), connect_args={"connect_timeout": 5})
+    try:
+        Base.metadata.create_all(engine)
+        from_models = _schema_definitions(engine)
+    finally:
+        engine.dispose()
+        drop_database(name)
+
+    from_migrations = _schema_definitions(migration_engine)
+    assert from_migrations[0] == from_models[0]
+    assert from_migrations[1] == from_models[1]
+    assert any(table == "refresh_tokens" for table, *_ in from_models[0])
+
+
+def test_migrated_revocation_reasons(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    with migration_engine.connect() as connection:
+        definition = connection.execute(
+            text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_refresh_tokens_revocation_reason'")
+        ).scalar_one()
+
+    for reason in ("rotated", "reuse_detected", "logout", "revoked"):
+        assert f"'{reason}'" in definition
+    assert definition.count("::character varying") == 4  # exactly four allowed values

@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import make_url
 
-from app.core.config import Settings
+from app.core.config import AuthConfigurationError, Settings
 
 RESERVED_PASSWORD = "p@ss:w/rd#50%?&=+ $x"
 
@@ -180,3 +180,170 @@ def test_job_settings_must_be_positive(field: str, value: int) -> None:
 def test_backoff_max_must_not_be_below_base() -> None:
     with pytest.raises(ValidationError, match="job_backoff_max_seconds"):
         make_settings(job_backoff_base_seconds=30, job_backoff_max_seconds=10)
+
+
+# --- Authentication settings -----------------------------------------------------------------
+
+AUTH_ENV_VARS = (
+    "TRACEIQ_JWT_SECRET",
+    "TRACEIQ_CSRF_SECRET",
+    "TRACEIQ_JWT_ISSUER",
+    "TRACEIQ_JWT_AUDIENCE",
+    "TRACEIQ_JWT_LEEWAY_SECONDS",
+    "TRACEIQ_ACCESS_TOKEN_TTL_SECONDS",
+    "TRACEIQ_REFRESH_TOKEN_TTL_SECONDS",
+    "TRACEIQ_REFRESH_TOKEN_ABSOLUTE_TTL_SECONDS",
+    "TRACEIQ_AUTH_COOKIE_SECURE",
+    "TRACEIQ_AUTH_COOKIE_SAMESITE",
+    "TRACEIQ_AUTH_COOKIE_DOMAIN",
+    "TRACEIQ_AUTH_REGISTRATION_ENABLED",
+    "TRACEIQ_ENV",
+)
+STRONG_JWT_SECRET = "Zq3vN8wL1xK7pR2tY6uB9mC4hJ0sD5fG-jwt"
+STRONG_CSRF_SECRET = "Hk2mP9qW4zR7tX1vB6nL3cF8yJ5sD0gA-csrf"
+
+
+@pytest.fixture
+def _no_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in AUTH_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_auth_settings_defaults() -> None:
+    settings = make_settings()
+
+    assert settings.jwt_secret is None and settings.csrf_secret is None
+    assert (settings.jwt_issuer, settings.jwt_audience, settings.jwt_leeway_seconds) == ("traceiq", "traceiq-api", 10)
+    assert settings.access_token_ttl_seconds == 15 * 60
+    assert settings.refresh_token_ttl_seconds == 7 * 24 * 3600
+    assert settings.refresh_token_absolute_ttl_seconds == 30 * 24 * 3600
+    assert settings.auth_cookie_secure is True
+    assert settings.auth_cookie_samesite == "lax"
+    assert settings.auth_cookie_domain is None
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_settings_load_without_auth_secrets() -> None:
+    # Processes that do not authenticate (the worker) must start without secrets.
+    settings = make_settings(env="production")
+
+    assert settings.jwt_secret is None
+    assert settings.sqlalchemy_url is not None
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_auth_settings_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACEIQ_JWT_SECRET", STRONG_JWT_SECRET)
+    monkeypatch.setenv("TRACEIQ_CSRF_SECRET", STRONG_CSRF_SECRET)
+    monkeypatch.setenv("TRACEIQ_ACCESS_TOKEN_TTL_SECONDS", "300")
+    monkeypatch.setenv("TRACEIQ_AUTH_COOKIE_SECURE", "false")
+    monkeypatch.setenv("TRACEIQ_AUTH_COOKIE_SAMESITE", "Strict")
+    monkeypatch.setenv("TRACEIQ_AUTH_COOKIE_DOMAIN", "example.com")
+
+    settings = make_settings()
+
+    assert settings.jwt_secret is not None and settings.jwt_secret.get_secret_value() == STRONG_JWT_SECRET
+    assert settings.csrf_secret is not None and settings.csrf_secret.get_secret_value() == STRONG_CSRF_SECRET
+    assert settings.access_token_ttl_seconds == 300
+    assert settings.auth_cookie_secure is False
+    assert settings.auth_cookie_samesite == "strict"
+    assert settings.auth_cookie_domain == "example.com"
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_empty_secrets_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACEIQ_JWT_SECRET", "")
+    monkeypatch.setenv("TRACEIQ_CSRF_SECRET", "")
+
+    settings = make_settings()
+    assert settings.jwt_secret is None and settings.csrf_secret is None
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_secrets_are_hidden_in_repr() -> None:
+    settings = make_settings(jwt_secret=STRONG_JWT_SECRET, csrf_secret=STRONG_CSRF_SECRET)
+
+    assert STRONG_JWT_SECRET not in repr(settings) and STRONG_CSRF_SECRET not in repr(settings)
+    assert STRONG_JWT_SECRET not in str(settings.model_dump())
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize(
+    ("env", "override", "expected"),
+    [
+        ("development", None, True),
+        ("test", None, True),
+        ("production", None, False),
+        ("production", True, True),
+        ("development", False, False),
+    ],
+)
+def test_registration_enabled(env: str, override: bool | None, expected: bool) -> None:
+    assert make_settings(env=env, auth_registration_enabled=override).registration_enabled is expected
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_valid_auth_secrets_pass() -> None:
+    make_settings(jwt_secret=STRONG_JWT_SECRET, csrf_secret=STRONG_CSRF_SECRET).validate_auth_secrets()
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize(
+    ("jwt_secret", "csrf_secret", "expected"),
+    [
+        (None, None, ["TRACEIQ_JWT_SECRET is not set", "TRACEIQ_CSRF_SECRET is not set"]),
+        (None, STRONG_CSRF_SECRET, ["TRACEIQ_JWT_SECRET is not set"]),
+        (STRONG_JWT_SECRET, None, ["TRACEIQ_CSRF_SECRET is not set"]),
+        ("short-secret", STRONG_CSRF_SECRET, ["TRACEIQ_JWT_SECRET must be at least 32 bytes"]),
+        (STRONG_JWT_SECRET, "x" * 31, ["TRACEIQ_CSRF_SECRET must be at least 32 bytes"]),
+        ("a" * 64, STRONG_CSRF_SECRET, ["TRACEIQ_JWT_SECRET looks like a placeholder or non-random value"]),
+        ("ab" * 16, STRONG_CSRF_SECRET, ["TRACEIQ_JWT_SECRET looks like a placeholder"]),
+        ("change-me-change-me-change-me-1234567", STRONG_CSRF_SECRET, ["TRACEIQ_JWT_SECRET looks like a placeholder"]),
+        (STRONG_JWT_SECRET, "replace-me-with-a-real-secret-0123456", ["TRACEIQ_CSRF_SECRET looks like a placeholder"]),
+        (STRONG_JWT_SECRET, STRONG_JWT_SECRET, ["must be different"]),
+    ],
+)
+def test_invalid_auth_secrets_are_rejected(
+    jwt_secret: str | None, csrf_secret: str | None, expected: list[str]
+) -> None:
+    settings = make_settings(jwt_secret=jwt_secret, csrf_secret=csrf_secret)
+
+    with pytest.raises(AuthConfigurationError) as exc_info:
+        settings.validate_auth_secrets()
+    message = str(exc_info.value)
+    for fragment in expected:
+        assert fragment in message
+    assert "secrets.token_urlsafe" in message  # tells the operator how to fix it
+    for secret in (jwt_secret, csrf_secret):
+        if secret and len(secret) >= 8:
+            assert secret not in message
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_secret_length_is_measured_in_bytes() -> None:
+    # 16 two-byte characters = 32 bytes.
+    make_settings(jwt_secret="éàüöäçñøåæœßþðłž", csrf_secret=STRONG_CSRF_SECRET).validate_auth_secrets()
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"refresh_token_ttl_seconds": 3600, "refresh_token_absolute_ttl_seconds": 600}, "refresh_token_absolute_ttl"),
+        ({"access_token_ttl_seconds": 7200, "refresh_token_ttl_seconds": 3600}, "access_token_ttl_seconds"),
+        ({"auth_cookie_samesite": "none", "auth_cookie_secure": False}, "requires auth_cookie_secure"),
+        ({"auth_cookie_samesite": "loose"}, "auth_cookie_samesite"),
+        ({"access_token_ttl_seconds": 0}, "access_token_ttl_seconds"),
+        ({"jwt_leeway_seconds": -1}, "jwt_leeway_seconds"),
+        ({"jwt_leeway_seconds": 301}, "jwt_leeway_seconds"),
+    ],
+)
+def test_invalid_auth_settings_are_rejected(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        make_settings(**overrides)
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_samesite_none_allowed_with_secure_cookies() -> None:
+    assert make_settings(auth_cookie_samesite="NONE", auth_cookie_secure=True).auth_cookie_samesite == "none"
