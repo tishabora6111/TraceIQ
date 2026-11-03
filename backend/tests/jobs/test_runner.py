@@ -467,3 +467,44 @@ def test_real_sigterm_while_idle_stops_promptly() -> None:
 
     assert worker.stopping
     assert elapsed < 5
+
+
+# --- Sensitive data in logs ----------------------------------------------------------------
+
+
+SENSITIVE_VALUE = "patient-ssn-123-45-6789"
+
+
+def test_database_error_parameters_and_payload_never_reach_logs_or_last_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A handler's database error involving a sensitive value: not in logs, tracebacks or last_error."""
+    registry = JobRegistry()
+
+    @registry.handler("tests.sensitive", payload=MarkerPayload)
+    def sensitive(context: JobContext, payload: MarkerPayload) -> None:
+        # The sensitive payload value is bound as a SQL parameter of a failing statement.
+        context.session.execute(
+            text("INSERT INTO test_job_markers (marker) SELECT :marker WHERE 1 / 0 = 1"), {"marker": payload.marker}
+        )
+
+    job_id = enqueue_committed(registry, "tests.sensitive", {"marker": SENSITIVE_VALUE})
+
+    with caplog.at_level(logging.DEBUG):
+        result = make_worker(registry).run_once()
+
+    assert result is not None and result[1] is JobOutcome.RETRY_SCHEDULED
+    # Useful diagnostics are kept in the stored error...
+    last_error = job_row(job_id).last_error
+    assert last_error.startswith("DataError: (psycopg.errors.DivisionByZero) division by zero")
+    assert "[SQL parameters hidden due to hide_parameters=True]" in last_error
+    # ...but the value appears nowhere: not in last_error, messages, structured fields, or tracebacks.
+    assert SENSITIVE_VALUE not in last_error
+    formatter = logging.Formatter()
+    assert caplog.records, "expected log records from the job attempt"
+    for record in caplog.records:
+        assert SENSITIVE_VALUE not in formatter.format(record)
+        assert SENSITIVE_VALUE not in repr(record.__dict__)
+    # The failure itself was logged with its (sanitized) error.
+    failure = next(r for r in caplog.records if r.getMessage() == "Job attempt failed; retry scheduled")
+    assert failure.error == last_error  # type: ignore[attr-defined]

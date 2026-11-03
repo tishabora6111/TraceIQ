@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import Settings, get_settings
 from app.core.database import check_database_connection, get_db, get_engine
+from app.modules.jobs.execution import format_error
 
 RESERVED_PASSWORD = "p@ss:w/rd#50%?&=+ $x"
 
@@ -97,3 +98,45 @@ def test_wrong_password_is_rejected(reserved_password_role: str) -> None:
                 pass
     finally:
         engine.dispose()
+
+
+# --- SQL parameter values in errors ----------------------------------------------------------
+
+SENSITIVE_VALUE = "patient-ssn-123-45-6789"
+
+
+def _database_error_with_sensitive_parameter() -> Exception:
+    """Raise a real database error through the app's engine for a statement with a sensitive parameter.
+
+    Division by zero is used because PostgreSQL's own message for it does not echo any value.
+    """
+    session_gen = get_db()
+    session = next(session_gen)
+    try:
+        session.execute(text("SELECT :value WHERE 1 / 0 = 1"), {"value": SENSITIVE_VALUE})
+    except Exception as exc:
+        return exc
+    finally:
+        session_gen.close()
+    raise AssertionError("statement unexpectedly succeeded")
+
+
+def test_engine_hides_sql_parameters() -> None:
+    assert get_engine().hide_parameters is True
+
+
+def test_database_error_does_not_contain_parameter_values() -> None:
+    exc = _database_error_with_sensitive_parameter()
+
+    assert SENSITIVE_VALUE not in str(exc)
+    assert "SQL parameters hidden" in str(exc)
+
+
+def test_formatted_database_error_hides_parameters_but_keeps_diagnostics() -> None:
+    message = format_error(_database_error_with_sensitive_parameter())
+
+    assert SENSITIVE_VALUE not in message
+    # Still useful: exception type, the database's message, and the SQL text.
+    assert message.startswith("DataError: (psycopg.errors.DivisionByZero) division by zero")
+    assert "[SQL: SELECT %(value)s WHERE 1 / 0 = 1]" in message
+    assert "[SQL parameters hidden due to hide_parameters=True]" in message
