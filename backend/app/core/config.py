@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, PositiveFloat, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy import URL, make_url
 
@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     database_connect_timeout: int = 5
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    # Background jobs (defaults; individual handlers may override lease and max attempts).
+    job_default_lease_seconds: PositiveInt = 300
+    # Total attempts, including the first one.
+    job_default_max_attempts: PositiveInt = 5
+    job_backoff_base_seconds: PositiveFloat = 10.0
+    job_backoff_max_seconds: PositiveFloat = 3600.0
+    worker_poll_interval_seconds: PositiveFloat = 1.0
+    worker_maintenance_interval_seconds: PositiveFloat = 15.0
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
@@ -59,6 +68,12 @@ class Settings(BaseSettings):
     @classmethod
     def _empty_url_is_unset(cls, value: object) -> object:
         return None if value == "" else value
+
+    @model_validator(mode="after")
+    def _check_backoff_bounds(self) -> "Settings":
+        if self.job_backoff_max_seconds < self.job_backoff_base_seconds:
+            raise ValueError("job_backoff_max_seconds must be greater than or equal to job_backoff_base_seconds")
+        return self
 
     @property
     def sqlalchemy_url(self) -> URL:

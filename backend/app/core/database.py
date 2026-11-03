@@ -33,6 +33,9 @@ def get_engine() -> Engine:
         echo=settings.database_echo,
         pool_pre_ping=True,
         connect_args={"connect_timeout": settings.database_connect_timeout},
+        # Keep SQL parameter values (which may hold payload or user data) out of exception
+        # messages, and therefore out of stored job errors and logs. The SQL text is kept.
+        hide_parameters=True,
     )
 
 

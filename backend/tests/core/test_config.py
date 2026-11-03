@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import make_url
 
 from app.core.config import Settings
@@ -108,3 +109,74 @@ def test_explicit_url_overrides_parts() -> None:
 
 def test_empty_url_falls_back_to_parts() -> None:
     assert make_settings(database_url="", database_host="db").sqlalchemy_url.host == "db"
+
+
+JOB_ENV_VARS = (
+    "TRACEIQ_JOB_DEFAULT_LEASE_SECONDS",
+    "TRACEIQ_JOB_DEFAULT_MAX_ATTEMPTS",
+    "TRACEIQ_JOB_BACKOFF_BASE_SECONDS",
+    "TRACEIQ_JOB_BACKOFF_MAX_SECONDS",
+    "TRACEIQ_WORKER_POLL_INTERVAL_SECONDS",
+    "TRACEIQ_WORKER_MAINTENANCE_INTERVAL_SECONDS",
+)
+
+
+@pytest.fixture
+def _no_job_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in JOB_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures("_no_job_env")
+def test_job_settings_defaults() -> None:
+    settings = make_settings()
+
+    assert settings.job_default_lease_seconds == 300
+    assert settings.job_default_max_attempts == 5
+    assert settings.job_backoff_base_seconds == 10
+    assert settings.job_backoff_max_seconds == 3600
+    assert settings.worker_poll_interval_seconds == 1
+    assert settings.worker_maintenance_interval_seconds == 15
+
+
+@pytest.mark.usefixtures("_no_job_env")
+def test_job_settings_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACEIQ_JOB_DEFAULT_LEASE_SECONDS", "120")
+    monkeypatch.setenv("TRACEIQ_JOB_DEFAULT_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("TRACEIQ_JOB_BACKOFF_BASE_SECONDS", "2.5")
+    monkeypatch.setenv("TRACEIQ_JOB_BACKOFF_MAX_SECONDS", "60")
+    monkeypatch.setenv("TRACEIQ_WORKER_POLL_INTERVAL_SECONDS", "0.25")
+    monkeypatch.setenv("TRACEIQ_WORKER_MAINTENANCE_INTERVAL_SECONDS", "5")
+
+    settings = make_settings()
+
+    assert settings.job_default_lease_seconds == 120
+    assert settings.job_default_max_attempts == 3
+    assert settings.job_backoff_base_seconds == 2.5
+    assert settings.job_backoff_max_seconds == 60
+    assert settings.worker_poll_interval_seconds == 0.25
+    assert settings.worker_maintenance_interval_seconds == 5
+
+
+@pytest.mark.usefixtures("_no_job_env")
+@pytest.mark.parametrize(
+    "field",
+    [
+        "job_default_lease_seconds",
+        "job_default_max_attempts",
+        "job_backoff_base_seconds",
+        "job_backoff_max_seconds",
+        "worker_poll_interval_seconds",
+        "worker_maintenance_interval_seconds",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_job_settings_must_be_positive(field: str, value: int) -> None:
+    with pytest.raises(ValidationError, match=field):
+        make_settings(**{field: value})
+
+
+@pytest.mark.usefixtures("_no_job_env")
+def test_backoff_max_must_not_be_below_base() -> None:
+    with pytest.raises(ValidationError, match="job_backoff_max_seconds"):
+        make_settings(job_backoff_base_seconds=30, job_backoff_max_seconds=10)

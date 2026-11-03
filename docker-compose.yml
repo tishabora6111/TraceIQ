@@ -1,5 +1,33 @@
 name: traceiq
 
+# Shared by every service that runs the backend image (api, worker, migrate), so they always
+# see the same database and settings.
+x-backend-environment: &backend-environment
+  TRACEIQ_ENV: ${TRACEIQ_ENV:-development}
+  TRACEIQ_LOG_LEVEL: ${TRACEIQ_LOG_LEVEL:-INFO}
+  TRACEIQ_CORS_ORIGINS: ${TRACEIQ_CORS_ORIGINS:-http://localhost:5173}
+  # Passed as separate parts; the backend builds the URL with SQLAlchemy URL.create,
+  # so credentials are never interpolated into a URL string.
+  TRACEIQ_DATABASE_HOST: db
+  TRACEIQ_DATABASE_PORT: "5432"
+  TRACEIQ_DATABASE_USER: ${POSTGRES_USER:-traceiq}
+  TRACEIQ_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  TRACEIQ_DATABASE_NAME: ${POSTGRES_DB:-traceiq}
+  # Background jobs and worker.
+  TRACEIQ_JOB_DEFAULT_LEASE_SECONDS: ${TRACEIQ_JOB_DEFAULT_LEASE_SECONDS:-300}
+  TRACEIQ_JOB_DEFAULT_MAX_ATTEMPTS: ${TRACEIQ_JOB_DEFAULT_MAX_ATTEMPTS:-5}
+  TRACEIQ_JOB_BACKOFF_BASE_SECONDS: ${TRACEIQ_JOB_BACKOFF_BASE_SECONDS:-10}
+  TRACEIQ_JOB_BACKOFF_MAX_SECONDS: ${TRACEIQ_JOB_BACKOFF_MAX_SECONDS:-3600}
+  TRACEIQ_WORKER_POLL_INTERVAL_SECONDS: ${TRACEIQ_WORKER_POLL_INTERVAL_SECONDS:-1}
+  TRACEIQ_WORKER_MAINTENANCE_INTERVAL_SECONDS: ${TRACEIQ_WORKER_MAINTENANCE_INTERVAL_SECONDS:-15}
+
+# One image, built once and shared by api, worker and migrate.
+x-backend-image: &backend-image
+  image: traceiq-backend:local
+  build:
+    context: ./backend
+    target: runtime
+
 services:
   db:
     image: postgres:16-alpine
@@ -17,33 +45,48 @@ services:
       timeout: 5s
       retries: 10
 
-  api:
-    build:
-      context: ./backend
-      target: runtime
-    environment:
-      TRACEIQ_ENV: ${TRACEIQ_ENV:-development}
-      TRACEIQ_LOG_LEVEL: ${TRACEIQ_LOG_LEVEL:-INFO}
-      TRACEIQ_CORS_ORIGINS: ${TRACEIQ_CORS_ORIGINS:-http://localhost:5173}
-      # Passed as separate parts; the backend builds the URL with SQLAlchemy URL.create,
-      # so credentials are never interpolated into a URL string.
-      TRACEIQ_DATABASE_HOST: db
-      TRACEIQ_DATABASE_PORT: "5432"
-      TRACEIQ_DATABASE_USER: ${POSTGRES_USER:-traceiq}
-      TRACEIQ_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      TRACEIQ_DATABASE_NAME: ${POSTGRES_DB:-traceiq}
-    ports:
-      - "8000:8000"
+  # Applies database migrations, then exits. api and worker start only after it succeeds.
+  migrate:
+    <<: *backend-image
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-environment
+    restart: "no"
     depends_on:
       db:
         condition: service_healthy
+
+  api:
+    <<: *backend-image
+    environment: *backend-environment
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Background job worker (one job at a time per container; scale with --scale worker=N).
+  worker:
+    <<: *backend-image
+    command: ["python", "-m", "app.worker"]
+    environment: *backend-environment
+    # SIGTERM stops new claims and lets the current job finish. Jobs still running when the
+    # grace period ends are killed; their lease expires and recovery requeues them.
+    stop_grace_period: 60s
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   frontend:
     build: ./frontend
     environment:
       VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
     ports:
-      - "5173:5173"
+      - "${FRONTEND_PORT:-5173}:5173"
     depends_on:
       - api
 
