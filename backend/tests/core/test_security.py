@@ -4,8 +4,10 @@ import base64
 import hashlib
 import json
 import statistics
+import threading
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -577,3 +579,156 @@ def test_allowlist_entries_are_normalized() -> None:
 
 def test_empty_allowlist_allows_nothing() -> None:
     assert not is_origin_allowed("http://localhost:5173", [])
+
+
+# --- Concurrency bound on Argon2id work -------------------------------------------------------
+
+
+class _CountingHasher:
+    """Stands in for pwdlib's PasswordHash; records how many calls run at the same time."""
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.peak = 0
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def _work(self) -> None:
+        with self._lock:
+            self.active += 1
+            self.calls += 1
+            self.peak = max(self.peak, self.active)
+        time.sleep(0.05)
+        with self._lock:
+            self.active -= 1
+
+    def hash(self, password: str) -> str:
+        self._work()
+        return "$fake$hash"
+
+    def verify(self, password: str, password_hash: str) -> bool:
+        self._work()
+        return False
+
+    def verify_and_update(self, password: str, password_hash: str) -> tuple[bool, str | None]:
+        self._work()
+        return False, None
+
+
+def _limit_hashing(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
+    settings = security.get_settings().model_copy(update={"auth_max_concurrent_hashes": limit})
+    monkeypatch.setattr(security, "get_settings", lambda: settings)
+    security._hashing_semaphore.cache_clear()
+
+
+@pytest.fixture
+def counting_hasher(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CountingHasher]:
+    """Two hashing slots, and a counting fake in place of the real hasher."""
+    fake = _CountingHasher()
+    _limit_hashing(monkeypatch, 2)
+    monkeypatch.setattr(security, "_password_hash", fake)
+    monkeypatch.setattr(security, "_dummy_password_hash", lambda: "$fake$dummy")
+    yield fake
+    security._hashing_semaphore.cache_clear()
+
+
+def _run_concurrently(actions: list[Callable[[], object]]) -> None:
+    errors: list[BaseException] = []
+
+    def run(action: Callable[[], object]) -> None:
+        try:
+            action()
+        except BaseException as exc:  # pragma: no cover - surfaced by the assertion below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(action,)) for action in actions]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not errors
+    assert not any(thread.is_alive() for thread in threads)
+
+
+def test_concurrent_hashing_is_bounded(counting_hasher: _CountingHasher) -> None:
+    _run_concurrently([lambda: security.hash_password(PASSWORD)] * 10)
+
+    assert counting_hasher.calls == 10
+    assert counting_hasher.peak == 2
+
+
+def test_all_hashing_paths_share_one_bound(counting_hasher: _CountingHasher) -> None:
+    actions: list[Callable[[], object]] = [
+        lambda: security.hash_password(PASSWORD),
+        lambda: security.verify_password(PASSWORD, "$argon2id$stored"),
+        lambda: security.verify_password("x" * 300, "$argon2id$stored"),  # over-long: dummy path
+        lambda: security.verify_dummy_password(PASSWORD),
+    ] * 4
+
+    _run_concurrently(actions)
+
+    assert counting_hasher.calls == 16
+    assert counting_hasher.peak == 2
+
+
+def test_dummy_fallback_does_not_take_a_second_slot(
+    counting_hasher: _CountingHasher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed stored hash falls back to a dummy verification while the slot is held. Taking a
+    second slot would deadlock with a single slot."""
+    _limit_hashing(monkeypatch, 1)
+
+    def malformed(password: str, password_hash: str) -> tuple[bool, str | None]:
+        raise ValueError("malformed hash")
+
+    monkeypatch.setattr(counting_hasher, "verify_and_update", malformed)
+
+    _run_concurrently([lambda: security.verify_password(PASSWORD, "not-a-hash")] * 3)
+
+    assert counting_hasher.calls == 3  # one dummy verification each
+    assert counting_hasher.peak == 1
+
+
+def test_the_semaphore_is_shared_across_calls(counting_hasher: _CountingHasher) -> None:
+    first = security._hashing_semaphore()
+
+    security.hash_password(PASSWORD)
+    security.verify_dummy_password(PASSWORD)
+    security.verify_password(PASSWORD, "$argon2id$stored")
+
+    assert security._hashing_semaphore() is first
+
+
+def test_slots_are_released_after_errors(counting_hasher: _CountingHasher, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing_hash(password: str) -> str:
+        raise RuntimeError("hasher failed")
+
+    monkeypatch.setattr(counting_hasher, "hash", failing_hash)
+    for _ in range(5):  # more failures than slots: each one must release its slot
+        with pytest.raises(RuntimeError):
+            security.hash_password(PASSWORD)
+
+    semaphore = security._hashing_semaphore()
+    assert [semaphore.acquire(blocking=False) for _ in range(3)] == [True, True, False]
+    semaphore.release()
+    semaphore.release()
+
+
+def test_default_semaphore_uses_the_configured_limit() -> None:
+    security._hashing_semaphore.cache_clear()
+    try:
+        semaphore = security._hashing_semaphore()
+        limit = security.get_settings().auth_max_concurrent_hashes
+        acquired = [semaphore.acquire(blocking=False) for _ in range(limit + 1)]
+        assert acquired == [True] * limit + [False]
+        for _ in range(limit):
+            semaphore.release()
+    finally:
+        security._hashing_semaphore.cache_clear()
+
+
+def test_real_hashing_still_works_under_the_bound() -> None:
+    hashed = security.hash_password(PASSWORD)
+
+    assert security.verify_password(PASSWORD, hashed) == (True, None)
+    assert security.verify_password("wrong password!!", hashed) == (False, None)

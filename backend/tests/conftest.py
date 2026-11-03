@@ -26,6 +26,13 @@ from app.core.database import Base, get_engine, get_session_factory
 TEST_DATABASE_SUFFIX = "_test"
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 
+# Fixed signing secrets for the test suite only (the API refuses to start without valid ones).
+# Set before any settings are loaded; real environment variables take precedence over .env.
+TEST_JWT_SECRET = "test-jwt-secret-Vq8mZ2xR5tN1wK7pL4bC9hJ3sD6fG0yA"
+TEST_CSRF_SECRET = "test-csrf-secret-Hn4rT8vB2kM6qW1zX5cJ9pL3sF7dG0yE"
+os.environ["TRACEIQ_JWT_SECRET"] = TEST_JWT_SECRET
+os.environ["TRACEIQ_CSRF_SECRET"] = TEST_CSRF_SECRET
+
 
 def _redirect_to_test_database() -> URL:
     """Point all app settings at the test database; return the original (admin) URL."""
@@ -138,5 +145,6 @@ def settings() -> Settings:
 def client(settings: Settings) -> Iterator[TestClient]:
     from app.main import create_app
 
-    with TestClient(create_app(settings), raise_server_exceptions=False) as test_client:
+    # HTTPS, so Secure cookies behave as they do in production.
+    with TestClient(create_app(settings), base_url="https://testserver", raise_server_exceptions=False) as test_client:
         yield test_client

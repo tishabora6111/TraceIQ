@@ -16,7 +16,10 @@ import base64
 import hashlib
 import hmac
 import secrets
+import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -28,7 +31,7 @@ from pwdlib import PasswordHash
 from pwdlib.exceptions import PwdlibError
 from pwdlib.hashers.argon2 import Argon2Hasher
 
-from app.core.config import AuthConfigurationError, Settings
+from app.core.config import AuthConfigurationError, Settings, get_settings
 
 # --- Passwords -------------------------------------------------------------------------------
 
@@ -53,10 +56,31 @@ def check_password_policy(password: str) -> None:
         raise PasswordPolicyError(f"Password must be at most {PASSWORD_MAX_LENGTH} characters")
 
 
+@lru_cache(maxsize=1)
+def _hashing_semaphore() -> threading.BoundedSemaphore:
+    """One process-wide semaphore bounding concurrent Argon2id work (and so its memory use)."""
+    return threading.BoundedSemaphore(get_settings().auth_max_concurrent_hashes)
+
+
+@contextmanager
+def _hashing_slot() -> Iterator[None]:
+    """Hold one hashing slot. Every hash and verification, real or dummy, runs inside exactly one.
+
+    Never nest: the functions below call only the unguarded helpers while holding a slot.
+    """
+    semaphore = _hashing_semaphore()
+    semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
 def hash_password(password: str) -> str:
     """Hash a password that satisfies the policy."""
     check_password_policy(password)
-    return _password_hash.hash(password)
+    with _hashing_slot():
+        return _password_hash.hash(password)
 
 
 def verify_password(password: str, password_hash: str) -> tuple[bool, str | None]:
@@ -66,14 +90,15 @@ def verify_password(password: str, password_hash: str) -> tuple[bool, str | None
     parameters and should be replaced. Malformed hashes and over-long passwords verify as
     invalid (an over-long password still costs one dummy verification, to keep timing uniform).
     """
-    if not isinstance(password, str) or len(password) > PASSWORD_MAX_LENGTH:
-        verify_dummy_password("")
-        return False, None
-    try:
-        return _password_hash.verify_and_update(password, password_hash)
-    except (PwdlibError, ValueError, TypeError):
-        verify_dummy_password(password)
-        return False, None
+    with _hashing_slot():
+        if not isinstance(password, str) or len(password) > PASSWORD_MAX_LENGTH:
+            _verify_dummy("")
+            return False, None
+        try:
+            return _password_hash.verify_and_update(password, password_hash)
+        except (PwdlibError, ValueError, TypeError):
+            _verify_dummy(password)
+            return False, None
 
 
 @lru_cache(maxsize=1)
@@ -85,7 +110,14 @@ def verify_dummy_password(password: str) -> None:
     """Spend the same work as a real verification and discard the result.
 
     Used when no account matches, so response time does not reveal whether an email exists.
+    Takes a hashing slot like a real verification, so it queues identically under load.
     """
+    with _hashing_slot():
+        _verify_dummy(password)
+
+
+def _verify_dummy(password: str) -> None:
+    """Dummy verification without taking a slot; the caller must hold one."""
     candidate = password if isinstance(password, str) and len(password) <= PASSWORD_MAX_LENGTH else ""
     try:
         _password_hash.verify(candidate, _dummy_password_hash())

@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     auth_cookie_domain: str | None = None
     # None means: enabled in development and test, disabled in production.
     auth_registration_enabled: bool | None = None
+    # Process-wide cap on simultaneous Argon2id operations (each uses 64 MiB). Read once per process.
+    auth_max_concurrent_hashes: int = Field(4, ge=1, le=64)
 
     @field_validator("jwt_secret", "csrf_secret", "auth_cookie_domain", mode="before")
     @classmethod
@@ -133,6 +135,8 @@ class Settings(BaseSettings):
             raise ValueError("access_token_ttl_seconds must be <= refresh_token_ttl_seconds")
         if self.auth_cookie_samesite == "none" and not self.auth_cookie_secure:
             raise ValueError("auth_cookie_samesite='none' requires auth_cookie_secure=true")
+        if self.env == "production" and not self.auth_cookie_secure:
+            raise ValueError("auth_cookie_secure must be true in production")
         return self
 
     @property

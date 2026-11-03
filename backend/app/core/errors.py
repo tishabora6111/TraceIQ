@@ -12,7 +12,10 @@ from typing import Any
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.logging import database_error_metadata, find_database_error
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +108,33 @@ async def _handle_validation_error(request: Request, exc: RequestValidationError
     )
 
 
-async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled error", extra={"path": request.url.path})
+def _internal_error_response() -> JSONResponse:
     return _error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "Internal server error.")
+
+
+async def _handle_database_error(request: Request, exc: DBAPIError) -> JSONResponse:
+    """Log only safe metadata: the message can contain row values (e.g. a password hash or email)."""
+    logger.error("Unhandled database error", extra={"path": request.url.path, **database_error_metadata(exc)})
+    return _internal_error_response()
+
+
+async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    database_error = find_database_error(exc)
+    if database_error is not None:
+        # A database error wrapped in another exception: no traceback, which would embed its message.
+        logger.error(
+            "Unhandled error",
+            extra={"path": request.url.path, "error_type": type(exc).__name__, **database_error_metadata(database_error)},
+        )
+    else:
+        logger.exception("Unhandled error", extra={"path": request.url.path})
+    return _internal_error_response()
 
 
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AppError, _handle_app_error)  # type: ignore[arg-type]
     app.add_exception_handler(StarletteHTTPException, _handle_http_error)  # type: ignore[arg-type]
     app.add_exception_handler(RequestValidationError, _handle_validation_error)  # type: ignore[arg-type]
+    # Handled here rather than by the catch-all, which Starlette re-raises for the server to log.
+    app.add_exception_handler(DBAPIError, _handle_database_error)  # type: ignore[arg-type]
     app.add_exception_handler(Exception, _handle_unexpected_error)

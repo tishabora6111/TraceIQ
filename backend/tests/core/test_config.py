@@ -347,3 +347,60 @@ def test_invalid_auth_settings_are_rejected(overrides: dict[str, object], messag
 @pytest.mark.usefixtures("_no_auth_env")
 def test_samesite_none_allowed_with_secure_cookies() -> None:
     assert make_settings(auth_cookie_samesite="NONE", auth_cookie_secure=True).auth_cookie_samesite == "none"
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_secure_cookies_are_required_in_production() -> None:
+    with pytest.raises(ValidationError, match="auth_cookie_secure must be true in production"):
+        make_settings(env="production", auth_cookie_secure=False)
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_secure_cookies_from_the_environment_are_checked_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACEIQ_ENV", "production")
+    monkeypatch.setenv("TRACEIQ_AUTH_COOKIE_SECURE", "false")
+
+    with pytest.raises(ValidationError, match="auth_cookie_secure must be true in production"):
+        make_settings()
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize("env", ["development", "test"])
+def test_insecure_cookies_are_allowed_outside_production(env: str) -> None:
+    assert make_settings(env=env, auth_cookie_secure=False).auth_cookie_secure is False
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_production_accepts_secure_cookies() -> None:
+    assert make_settings(env="production").auth_cookie_secure is True
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_max_concurrent_hashes_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert make_settings().auth_max_concurrent_hashes == 4
+    monkeypatch.setenv("TRACEIQ_AUTH_MAX_CONCURRENT_HASHES", "8")
+    assert make_settings().auth_max_concurrent_hashes == 8
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError):
+            make_settings(auth_max_concurrent_hashes=invalid)
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize("limit", [1, 64])
+def test_max_concurrent_hashes_accepts_the_bounds(limit: int) -> None:
+    assert make_settings(auth_max_concurrent_hashes=limit).auth_max_concurrent_hashes == limit
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+@pytest.mark.parametrize("limit", [0, 65, 10_000])
+def test_max_concurrent_hashes_rejects_out_of_range_values(limit: int) -> None:
+    with pytest.raises(ValidationError, match="auth_max_concurrent_hashes"):
+        make_settings(auth_max_concurrent_hashes=limit)
+
+
+@pytest.mark.usefixtures("_no_auth_env")
+def test_max_concurrent_hashes_out_of_range_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACEIQ_AUTH_MAX_CONCURRENT_HASHES", "65")
+
+    with pytest.raises(ValidationError, match="auth_max_concurrent_hashes"):
+        make_settings()
