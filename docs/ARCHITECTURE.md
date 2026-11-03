@@ -173,13 +173,27 @@ The React app signs in with email/password, holds the access token in memory, an
 
 ## 6. Background Jobs
 
-- **Queue:** `jobs` table in PostgreSQL. Producers enqueue jobs inside their own transaction.
-- **Worker:** separate Python process (`backend/app/worker.py`) using the same codebase and database. Multiple workers may run safely.
-- **Claiming:** `SELECT … FOR UPDATE SKIP LOCKED` on queued jobs whose `run_at` has passed.
-- **Statuses:** `queued` → `running` → `succeeded` | `failed`. A failed attempt with attempts remaining returns to `queued` with a backoff `run_at`; after `max_attempts` the job stays `failed` with the last error recorded.
-- **Stale jobs:** jobs left `running` past a lease timeout (e.g. worker crash) are requeued.
-- **Handlers:** registered by job type in each module's `jobs.py`; must be idempotent.
-- **Scheduling:** recurring jobs (incident detection, drift, alerts, retention) are enqueued by the worker on a fixed interval.
+Implemented in `backend/app/modules/jobs/` (M1.2). PostgreSQL is the only queue: no Redis, Celery, or broker. All job and schedule timing uses the PostgreSQL clock.
+
+- **Queue:** the `jobs` table (§10.1). `enqueue(session, job_type, payload, *, run_at, dedupe_key)` adds a job to the **caller's** transaction and never commits or rolls back; the job is visible to workers only when the caller commits. Job IDs are UUIDs generated in Python.
+- **Handlers:** registered explicitly in a `JobRegistry` by name (`<module>.<action>`) with a Pydantic payload model (subclass of `JobPayload`, unknown fields rejected) and optional `max_attempts` / `lease_seconds` overrides. Duplicate names are rejected. A job's type is only ever a key into the registry; nothing is imported or evaluated from payloads or database rows. Modules register handlers in their `jobs.py`, imported explicitly by `backend/app/worker.py` (none exist yet). Handlers must be idempotent (delivery is at-least-once).
+- **Payloads:** validated against the handler's model when enqueued and again before execution, then stored as plain JSON (UUIDs, datetimes, decimals, enums converted; NaN/Infinity rejected).
+- **Deduplication:** an optional `dedupe_key` is unique among active (`queued`/`running`) jobs. A conflict inserts nothing and raises `DuplicateJobError` with the existing job's ID; the caller's transaction stays usable (`INSERT … ON CONFLICT DO NOTHING`).
+- **Statuses:** `queued` → `running` → `succeeded` | `failed`; a failed attempt with attempts remaining returns to `queued`. Consistency of lock and finish fields with the status is enforced by CHECK constraints.
+- **Claiming:** one statement in a short transaction, committed before the handler runs: the oldest due job (`run_at <= now()`, ordered by `run_at, created_at, id`) is selected `FOR UPDATE SKIP LOCKED` and marked `running` with `attempts + 1`, `locked_by` (worker ID), `locked_at`, `started_at`, and `lease_expires_at` (handler lease or `TRACEIQ_JOB_DEFAULT_LEASE_SECONDS`, default 300).
+- **Execution and ownership:** the handler runs in a fresh session and may not commit it. On return, the job is marked `succeeded` **in the same transaction** as the handler's writes, only if the worker still owns it: same `id`, `running`, same `locked_by`, same attempt number, and `lease_expires_at > clock_timestamp()`. If ownership was lost, the whole transaction, including every handler write, is rolled back. A worker can never complete or record a failure after its lease expires.
+- **Failures and retries:** on error the handler's transaction is rolled back, then the failure is recorded in a separate transaction under the same ownership conditions. The first execution is attempt 1. With attempts remaining (default `TRACEIQ_JOB_DEFAULT_MAX_ATTEMPTS` = 5 total), the job is requeued with `run_at = now + min(base · 2^(attempt−1), max) × random(0.5, 1.0)` (base 10 s, max 3600 s); otherwise it becomes `failed` with `finished_at`. `PermanentJobError`, an unknown job type, or an invalid stored payload fail immediately without retries. `last_error` holds `Type: message` with URL credentials masked, NUL characters removed, truncated to 2,000 characters; tracebacks are never stored.
+- **Stale-job recovery:** `running` jobs whose lease has expired are selected `FOR UPDATE SKIP LOCKED` (batches of 100); with attempts remaining they return to `queued` (due immediately), otherwise they become `failed`. Ownership and lease fields are cleared and `last_error` is set to "Lease expired before the job finished".
+- **Recurring jobs (interval-based, no cron):** schedules are registered in code (`register_schedule(name, job_type, interval, payload)`); the job type must be registered and the payload valid; duplicate names are rejected.
+  - *Synchronization* at worker startup, in one transaction serialized across workers by a PostgreSQL advisory lock: new schedules are created due immediately; changed definitions are updated without resetting `next_run_at` (a shorter interval may only bring it earlier); schedules removed from code are disabled, never deleted.
+  - *Ticks*, in one transaction: due enabled schedules are selected `FOR UPDATE SKIP LOCKED`; each enqueues its job with `dedupe_key = 'schedule:<name>'` and advances `next_run_at` to the first slot after now on its original interval grid, so downtime causes a single run, not a burst. If the previous run is still active the run is skipped (not an error) and the schedule still advances. A schedule this worker cannot build (job type not registered here, or invalid stored payload) is skipped without advancing. Any error rolls back the whole tick.
+- **Worker** (`python -m app.worker`, a separate process; never inside the API): synchronous, one job at a time per process; scale with more worker processes. Lifecycle:
+  1. *Startup:* check the database and synchronize schedules; failure exits with code 1. Logs `Worker ready`.
+  2. *Loop:* run maintenance when due (stale-job recovery, then one scheduler tick; every `TRACEIQ_WORKER_MAINTENANCE_INTERVAL_SECONDS`, default 15, between jobs), otherwise claim and execute the next job, or wait up to `TRACEIQ_WORKER_POLL_INTERVAL_SECONDS` (default 1) when idle. Errors in the loop are logged and retried after the poll interval.
+  3. *Shutdown:* the first SIGTERM/SIGINT stops new claims and lets the current job finish; the idle wait is interrupted immediately; exit code 0. A second signal forces exit (code 130); the interrupted job's writes roll back and lease recovery requeues it.
+
+  Logs are structured JSON with `worker_id` and job identifiers; payloads and credentials are never logged. In Docker Compose a one-off `migrate` service applies migrations before `api` and `worker` start; `worker` has `stop_grace_period: 60s` and `restart: unless-stopped`.
+- **Job history retention:** not decided yet. Finished jobs are kept; there is no automatic deletion.
 
 ## 7. Authentication and Security
 
@@ -250,7 +264,8 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 | `projects` | id, name, description, retention_overrides JSONB (null = config defaults), created_at |
 | `project_members` | project_id → projects, user_id → users, role (owner / admin / member), created_at; PK (project_id, user_id) |
 | `api_keys` | id, project_id → projects, key_hash, prefix, revoked_at |
-| `jobs` | id, type, status, payload JSONB, attempts, max_attempts, run_at, locked_at, last_error, created_at, finished_at |
+| `jobs` | id (UUID, generated in Python), type, status (queued / running / succeeded / failed), payload JSONB, attempts (incremented at claim), max_attempts (total, including the first), run_at, locked_by, locked_at, lease_expires_at, started_at, finished_at, last_error, dedupe_key, created_at, updated_at. CHECK constraints: valid status; `0 <= attempts <= max_attempts`, `max_attempts >= 1`; `running` requires `locked_by`, `locked_at`, `lease_expires_at` and `started_at`; every other status requires `locked_by`, `locked_at` and `lease_expires_at` to be NULL; `finished_at` is set exactly when the status is `succeeded` or `failed` |
+| `job_schedules` | name (PK), job_type, interval_seconds (CHECK > 0), payload JSONB, enabled (removed schedules are disabled, not deleted), next_run_at, last_enqueued_at, created_at, updated_at |
 
 ### 10.2 LLM / RAG
 | Table | Key columns |
@@ -296,7 +311,8 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 
 ### 10.6 Indexing
 - Foreign keys indexed.
-- `traces (project_id, started_at)`, `spans (trace_id)`, `prediction_logs (model_version_id, timestamp)`, `jobs (status, run_at)`, `users (email)` unique, `refresh_tokens (token_hash)` unique, `refresh_tokens (family_id)`.
+- `traces (project_id, started_at)`, `spans (trace_id)`, `prediction_logs (model_version_id, timestamp)`, `users (email)` unique, `refresh_tokens (token_hash)` unique, `refresh_tokens (family_id)`.
+- Jobs: `jobs (run_at, created_at) WHERE status = 'queued'` (claiming), `jobs (lease_expires_at) WHERE status = 'running'` (recovery), `jobs (type, status)`, `jobs (finished_at)`, and a partial unique index `jobs (dedupe_key) WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'running')` (active deduplication). `job_schedules (next_run_at) WHERE enabled` (due schedules).
 - `incidents (project_id, status, last_seen_at)`, `incidents (project_id, fingerprint)`, `incidents (resolved_at)`, `investigation_reports (project_id, updated_at)`, `investigation_report_items (report_id, kind)`, `investigation_report_revisions (report_id, revision)` unique.
 - A partial unique index on `project_members (project_id) WHERE role = 'owner'` enforces a single Owner.
 - Retention deletes rely on the time indexes above. Partitioning of `spans` and `prediction_logs` by time is deferred until data volume requires it.

@@ -1,4 +1,3 @@
-import os
 import uuid
 from collections.abc import Iterator
 
@@ -13,19 +12,7 @@ from app.core.database import check_database_connection, get_db, get_engine
 
 RESERVED_PASSWORD = "p@ss:w/rd#50%?&=+ $x"
 
-pytestmark = pytest.mark.db
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _require_database() -> None:
-    """Skip when PostgreSQL is unreachable, unless TRACEIQ_TEST_REQUIRE_DB=1 (Docker test image, CI)."""
-    try:
-        check_database_connection()
-    except OperationalError as exc:
-        message = f"PostgreSQL not reachable with the configured database settings: {exc.orig}"
-        if os.environ.get("TRACEIQ_TEST_REQUIRE_DB") == "1":
-            pytest.fail(message)
-        pytest.skip(message)
+pytestmark = [pytest.mark.db, pytest.mark.usefixtures("database")]
 
 
 def test_database_connection_succeeds() -> None:
