@@ -5,6 +5,7 @@ any exception. Read-only functions (``get_authenticated_user``) never commit or 
 Never logs emails, passwords, or tokens; log lines carry only user and session ids.
 """
 
+import hmac
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -226,9 +227,32 @@ def _require_csrf(token: RefreshToken, csrf_header: str | None, csrf_cookie: str
         header_token=csrf_header, cookie_token=csrf_cookie, session_id=token.family_id, settings=settings
     ):
         logger.warning(
-            "CSRF validation failed", extra={"user_id": str(token.user_id), "session_id": str(token.family_id)}
+            "CSRF validation failed",
+            extra={
+                "user_id": str(token.user_id),
+                "session_id": str(token.family_id),
+                **_csrf_failure_details(csrf_header, csrf_cookie),
+            },
         )
         raise CsrfValidationError()
+
+
+def _csrf_failure_details(csrf_header: str | None, csrf_cookie: str | None) -> dict[str, object]:
+    """Which part of the double-submit check failed, for diagnosis. Never includes token values:
+    only presence, lengths, and whether header and cookie are equal."""
+    if not csrf_header:
+        reason = "missing_header"
+    elif not csrf_cookie:
+        reason = "missing_cookie"
+    elif not hmac.compare_digest(csrf_header.encode("utf-8"), csrf_cookie.encode("utf-8")):
+        reason = "header_cookie_mismatch"
+    else:
+        reason = "invalid_signature"  # equal values not signed for this session
+    return {
+        "reason": reason,
+        "header_length": len(csrf_header) if csrf_header else 0,
+        "cookie_length": len(csrf_cookie) if csrf_cookie else 0,
+    }
 
 
 def _reject_refresh(reason: str, token: RefreshToken | None = None) -> NotAuthenticatedError:

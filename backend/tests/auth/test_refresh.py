@@ -115,9 +115,16 @@ def test_chain_of_rotations(client: TestClient, user: User) -> None:
     all_tokens = tokens()
     assert len(all_tokens) == 5
     assert len({token.family_id for token in all_tokens}) == 1
-    assert [token.revocation_reason for token in all_tokens] == ["rotated"] * 4 + [None]
-    for previous, following in zip(all_tokens, all_tokens[1:], strict=False):
-        assert previous.replaced_by_id == following.id
+    # Follow the replaced_by chain from the login's token (created_at comes from the database
+    # clock, which can step backwards on Docker Desktop, so it is not used for ordering).
+    by_id = {token.id: token for token in all_tokens}
+    replaced = {token.replaced_by_id for token in all_tokens}
+    [current] = [token for token in all_tokens if token.id not in replaced]
+    chain = [current]
+    while chain[-1].replaced_by_id is not None:
+        chain.append(by_id[chain[-1].replaced_by_id])
+    assert len(chain) == 5
+    assert [token.revocation_reason for token in chain] == ["rotated"] * 4 + [None]
     assert me(client, session.access_token).status_code == 200
 
 

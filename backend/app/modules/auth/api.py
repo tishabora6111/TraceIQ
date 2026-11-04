@@ -21,9 +21,21 @@ DbSession = Annotated[Session, Depends(get_db)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 # Cookie-authenticated endpoints read the refresh token only from its HttpOnly cookie, and the
 # CSRF token from both its cookie and the X-CSRF-Token header (signed double-submit).
-RefreshCookie = Annotated[str | None, Cookie(alias=REFRESH_COOKIE_NAME)]
-CsrfCookie = Annotated[str | None, Cookie(alias=CSRF_COOKIE_NAME)]
-CsrfHeader = Annotated[str | None, Header(alias="X-CSRF-Token")]
+# The cookies are hidden from the OpenAPI schema: browsers send them automatically and never let
+# page scripts (including Swagger UI) set a Cookie header, so input fields for them would do nothing.
+RefreshCookie = Annotated[str | None, Cookie(alias=REFRESH_COOKIE_NAME, include_in_schema=False)]
+CsrfCookie = Annotated[str | None, Cookie(alias=CSRF_COOKIE_NAME, include_in_schema=False)]
+CsrfHeader = Annotated[
+    str | None,
+    Header(
+        alias="X-CSRF-Token",
+        description=(
+            "The exact `csrf_token` value from the latest login or refresh response (also the value of the"
+            " `traceiq_csrf` cookie). It must match the cookie. In Swagger UI, paste the whole value without"
+            " quotes; it changes on every refresh."
+        ),
+    ),
+]
 
 
 def _session_response(response: Response, result: service.LoginResult, settings: Settings) -> LoginResponse:

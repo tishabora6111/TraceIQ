@@ -117,8 +117,24 @@ def me(client: TestClient, access_token: str) -> Response:
 
 
 def tokens() -> list[RefreshToken]:
+    """All refresh tokens, each family in rotation order (oldest first, following replaced_by_id).
+
+    created_at comes from the database clock, which can step backwards on Docker Desktop, so it
+    only orders the families and tokens without a chain link, never a rotation chain.
+    """
     with get_session_factory()() as session:
-        return list(session.scalars(select(RefreshToken).order_by(RefreshToken.created_at, RefreshToken.id)))
+        rows = list(session.scalars(select(RefreshToken).order_by(RefreshToken.created_at, RefreshToken.id)))
+    by_id = {token.id: token for token in rows}
+    replacements = {token.replaced_by_id for token in rows if token.replaced_by_id is not None}
+    ordered: list[RefreshToken] = []
+    for token in rows:
+        if token.id in replacements:
+            continue  # reached through its predecessor
+        current: RefreshToken | None = token
+        while current is not None and current not in ordered:
+            ordered.append(current)
+            current = by_id.get(current.replaced_by_id) if current.replaced_by_id else None
+    return ordered
 
 
 def active_tokens() -> list[RefreshToken]:
