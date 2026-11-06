@@ -1,13 +1,15 @@
 """Public interface of the auth module.
 
 Each function that writes manages its own transaction: it commits on success and rolls back on
-any exception. Read-only functions (``get_authenticated_user``) never commit or roll back.
+any exception. Read-only functions (``get_authenticated_user``, ``get_users``,
+``find_user_by_email``) never commit or roll back.
 Never logs emails, passwords, or tokens; log lines carry only user and session ids.
 """
 
 import hmac
 import logging
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -86,6 +88,24 @@ def get_authenticated_user(
         extra={"reason": reason, "user_id": str(user_id), "session_id": str(session_id)},
     )
     raise NotAuthenticatedError()
+
+
+def get_users(session: Session, user_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, UserRead]:
+    """The users with the given ids, keyed by id, fetched in one query (for other modules, e.g. to
+    show project members). Unknown ids are absent from the result; inactive users are included,
+    with ``is_active`` false. Read-only: it neither commits nor rolls back.
+    """
+    unique_ids = set(user_ids)
+    return {user.id: UserRead.model_validate(user) for user in repository.get_users_by_ids(session, unique_ids)}
+
+
+def find_user_by_email(session: Session, email: str) -> UserRead | None:
+    """The user registered with ``email`` (trimmed and lower-cased first, as at registration), or
+    None. Inactive users are returned, with ``is_active`` false; callers decide what that means.
+    Read-only: it neither commits nor rolls back.
+    """
+    user = repository.get_user_by_email(session, normalize_email(email))
+    return UserRead.model_validate(user) if user is not None else None
 
 
 def register_user(session: Session, *, email: str, password: str, settings: Settings | None = None) -> UserRead:

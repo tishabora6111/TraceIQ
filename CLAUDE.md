@@ -36,6 +36,7 @@ Do not add frameworks, services, or infrastructure (Redis, Celery, other queues,
 2. **Module boundaries are enforced by convention:**
    - Each module lives in `backend/app/modules/<module>/`.
    - Modules call each other only through the other module's `service.py` public functions.
+   - Exception: a module's `dependencies.py` is also public, for FastAPI dependencies other modules' routers need (e.g. `auth.dependencies.CurrentUser`, `require_allowed_origin_for_writes`, `projects.dependencies.require_project_role`).
    - A module never imports another module's `models.py`, `repository.py`, or internal helpers.
    - A module owns its tables; no other module writes to them.
 3. **Layering inside a module:** `api.py` (router) → `service.py` (business logic) → `repository.py` (SQLAlchemy queries). Routers contain no business logic; services contain no HTTP concerns.

@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import make_url
 
-from app.core.config import AuthConfigurationError, Settings
+from app.core.config import MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, AuthConfigurationError, Settings
 
 RESERVED_PASSWORD = "p@ss:w/rd#50%?&=+ $x"
 
@@ -410,6 +410,57 @@ def test_empty_registration_override_means_environment_default(
 
     assert settings.auth_registration_enabled is None
     assert settings.registration_enabled is enabled
+
+
+RETENTION_DEFAULTS = {
+    "retention_traces_days": 30,
+    "retention_evaluation_results_days": 90,
+    "retention_prediction_logs_days": 30,
+    "retention_incidents_days_after_resolution": 180,
+    "retention_investigation_reports_days_after_update": 180,
+}
+
+
+@pytest.fixture
+def _no_retention_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in RETENTION_DEFAULTS:
+        monkeypatch.delenv(f"TRACEIQ_{name.upper()}", raising=False)
+
+
+@pytest.mark.usefixtures("_no_retention_env")
+def test_retention_defaults() -> None:
+    settings = make_settings()
+
+    assert {name: getattr(settings, name) for name in RETENTION_DEFAULTS} == RETENTION_DEFAULTS
+    # Model artifacts are kept until manually deleted: there is deliberately no setting.
+    assert not [name for name in Settings.model_fields if "artifact" in name]
+
+
+@pytest.mark.usefixtures("_no_retention_env")
+@pytest.mark.parametrize("name", list(RETENTION_DEFAULTS))
+def test_retention_from_the_environment(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.setenv(f"TRACEIQ_{name.upper()}", "45")
+
+    assert getattr(make_settings(), name) == 45
+
+
+@pytest.mark.usefixtures("_no_retention_env")
+@pytest.mark.parametrize("name", list(RETENTION_DEFAULTS))
+@pytest.mark.parametrize("days", [MIN_RETENTION_DAYS, MAX_RETENTION_DAYS])
+def test_retention_accepts_the_bounds(name: str, days: int) -> None:
+    assert getattr(make_settings(**{name: days}), name) == days
+
+
+@pytest.mark.usefixtures("_no_retention_env")
+@pytest.mark.parametrize("name", list(RETENTION_DEFAULTS))
+@pytest.mark.parametrize("days", [0, -1, MAX_RETENTION_DAYS + 1])
+def test_retention_rejects_out_of_range_values(name: str, days: int) -> None:
+    with pytest.raises(ValidationError, match=name):
+        make_settings(**{name: days})
+
+
+def test_retention_bounds() -> None:
+    assert (MIN_RETENTION_DAYS, MAX_RETENTION_DAYS) == (1, 3650)
 
 
 @pytest.mark.usefixtures("_no_auth_env")

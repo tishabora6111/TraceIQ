@@ -65,11 +65,37 @@ CurrentUser = Annotated[UserRead, Depends(get_current_user)]
 MAX_LOGGED_ORIGIN_LENGTH = 255
 
 
+# Methods that must not change state (RFC 9110). Every other method counts as a write.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+
 def require_allowed_origin(request: Request, settings: Annotated[Settings, Depends(get_settings)]) -> None:
     """Reject the request unless its Origin (or, if absent, Referer) is in TRACEIQ_CORS_ORIGINS.
 
     A request with neither header is rejected: browsers always send Origin on these requests.
     """
+    _check_origin(request, settings)
+
+
+def require_allowed_origin_for_writes(
+    request: Request, settings: Annotated[Settings, Depends(get_settings)]
+) -> None:
+    """``require_allowed_origin`` for every state-changing request (any method except GET, HEAD,
+    OPTIONS and TRACE); safe methods pass unchecked.
+
+    Intended as a router-level dependency for JWT-authenticated routers, so that every write route,
+    including ones added later, gets Origin validation (ARCHITECTURE §7.2)::
+
+        router = APIRouter(dependencies=[Depends(require_allowed_origin_for_writes)])
+
+    It is an addition to authentication, never a replacement: routes still declare ``CurrentUser``.
+    Not for API-key ingestion routers, which serve non-browser clients.
+    """
+    if request.method.upper() not in SAFE_METHODS:
+        _check_origin(request, settings)
+
+
+def _check_origin(request: Request, settings: Settings) -> None:
     origin = request_origin(request.headers.get("origin"), request.headers.get("referer"))
     if not is_origin_allowed(origin, settings.cors_origins):
         logged_origin = origin[:MAX_LOGGED_ORIGIN_LENGTH] if origin else None

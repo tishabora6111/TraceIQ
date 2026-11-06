@@ -1,14 +1,15 @@
 import statistics
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from app.core.config import Settings
-from app.core.database import get_session_factory
+from app.core.database import get_engine, get_session_factory
 from app.core.security import decode_access_token, generate_opaque_token, hash_opaque_token
 from app.modules.auth import repository, service
 from app.modules.auth.errors import (
@@ -19,7 +20,7 @@ from app.modules.auth.errors import (
     RegistrationDisabledError,
 )
 from app.modules.auth.models import RefreshToken, User
-from app.modules.auth.schemas import normalize_email
+from app.modules.auth.schemas import UserRead, normalize_email
 from tests.auth.conftest import PASSWORD
 
 pytestmark = [pytest.mark.db, pytest.mark.usefixtures("clean_database")]
@@ -273,6 +274,111 @@ def test_register_domain_errors_roll_back(settings: Settings, create_user: Creat
         with pytest.raises((EmailAlreadyRegisteredError, InvalidPasswordError)):
             service.register_user(session, email=email, password=password, settings=settings)
         assert not session.in_transaction()
+
+
+# --- User lookups for other modules ------------------------------------------------------------
+
+
+@contextmanager
+def _recorded_statements() -> Iterator[list[str]]:
+    """SQL statements executed on the shared engine while the block runs."""
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        statements.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def test_get_users_returns_users_by_id_in_one_query(create_user: CreateUser) -> None:
+    alice, bob = create_user("alice@example.com"), create_user("bob@example.com")
+    create_user("carol@example.com")
+
+    with get_session_factory()() as session, _recorded_statements() as statements:
+        users = service.get_users(session, [alice.id, bob.id, alice.id])
+
+    assert set(users) == {alice.id, bob.id}
+    assert users[alice.id].email == "alice@example.com" and users[bob.id].email == "bob@example.com"
+    assert all(isinstance(user, UserRead) for user in users.values())
+    assert len([s for s in statements if s.lstrip().upper().startswith("SELECT")]) == 1
+
+
+def test_get_users_skips_unknown_ids_and_includes_inactive_users(create_user: CreateUser) -> None:
+    inactive = create_user("inactive@example.com", is_active=False)
+
+    with get_session_factory()() as session:
+        users = service.get_users(session, [inactive.id, uuid.uuid4()])
+
+    assert list(users) == [inactive.id]
+    assert users[inactive.id].is_active is False
+
+
+def test_get_users_with_no_ids_makes_no_query() -> None:
+    with get_session_factory()() as session, _recorded_statements() as statements:
+        assert service.get_users(session, []) == {}
+        assert service.get_users(session, iter(())) == {}
+    assert statements == []
+
+
+@pytest.mark.parametrize("email", ["user@example.com", "USER@Example.COM", "  user@example.com\t"])
+def test_find_user_by_email_normalizes_the_email(create_user: CreateUser, email: str) -> None:
+    user = create_user()
+
+    with get_session_factory()() as session:
+        found = service.find_user_by_email(session, email)
+
+    assert found is not None and found.id == user.id
+
+
+def test_find_user_by_email_returns_none_for_unknown_emails(create_user: CreateUser) -> None:
+    create_user()
+
+    with get_session_factory()() as session:
+        assert service.find_user_by_email(session, "nobody@example.com") is None
+        assert service.find_user_by_email(session, "") is None
+
+
+def test_find_user_by_email_returns_inactive_users(create_user: CreateUser) -> None:
+    create_user(is_active=False)
+
+    with get_session_factory()() as session:
+        found = service.find_user_by_email(session, "user@example.com")
+
+    assert found is not None and found.is_active is False
+
+
+def test_user_lookups_expose_no_secrets(create_user: CreateUser) -> None:
+    user = create_user()
+
+    with get_session_factory()() as session:
+        results = [service.get_users(session, [user.id])[user.id], service.find_user_by_email(session, user.email)]
+
+    for result in results:
+        assert isinstance(result, UserRead)
+        assert set(result.model_dump()) == {"id", "email", "is_active", "created_at", "last_login_at"}
+        assert "$argon2" not in repr(result) and "$argon2" not in result.model_dump_json()
+
+
+def test_user_lookups_are_read_only(create_user: CreateUser) -> None:
+    """Neither commits nor rolls back: a caller's pending work in the same session is untouched."""
+    user = create_user()
+
+    with get_session_factory()() as session:
+        pending = User(email="pending@example.com", password_hash="$argon2id$pending")
+        session.add(pending)
+        service.get_users(session, [user.id])
+        service.find_user_by_email(session, "nobody@example.com")
+        assert session.in_transaction()
+        assert pending in session.new
+        session.rollback()
+
+    with get_session_factory()() as session:
+        assert service.find_user_by_email(session, "pending@example.com") is None
 
 
 # --- Authenticated user -----------------------------------------------------------------------

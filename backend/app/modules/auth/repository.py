@@ -1,6 +1,7 @@
 """SQL for the auth module's tables. Callers own the transaction: nothing here commits."""
 
 import uuid
+from collections.abc import Collection
 from datetime import datetime
 
 from sqlalchemy import select, update
@@ -31,6 +32,13 @@ def has_active_session(session: Session, *, user_id: uuid.UUID, family_id: uuid.
         .exists()
     )
     return bool(session.scalar(select(active)))
+
+
+def get_users_by_ids(session: Session, user_ids: Collection[uuid.UUID]) -> list[User]:
+    """Users whose id is in ``user_ids``, in one query. Unknown ids are skipped."""
+    if not user_ids:
+        return []
+    return list(session.scalars(select(User).where(User.id.in_(user_ids))))
 
 
 def get_user_by_email(session: Session, email: str) -> User | None:

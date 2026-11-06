@@ -23,6 +23,10 @@ MIN_AUTH_SECRET_BYTES = 32
 _MIN_SECRET_DISTINCT_CHARS = 10
 _PLACEHOLDER_MARKERS = ("change-me", "changeme", "replace-me", "replaceme", "example")
 
+# Bounds for every retention period, in days: the configured defaults and per-project overrides.
+MIN_RETENTION_DAYS = 1
+MAX_RETENTION_DAYS = 3650
+
 
 class AuthConfigurationError(RuntimeError):
     """Authentication secrets are missing or too weak. The message never contains secret values."""
@@ -95,6 +99,19 @@ class Settings(BaseSettings):
     auth_max_concurrent_hashes: int = Field(4, ge=1, le=64)
     # How long a request waits for a hashing slot before failing with 503 (overload protection).
     auth_hash_wait_timeout_seconds: float = Field(10.0, gt=0, le=120)
+
+    # Retention defaults in days (D7). Projects may override them within the same bounds; modules
+    # read them from here and never hard-code periods. Model artifacts have no setting: they are
+    # kept until manually deleted. Unresolved incidents are never deleted.
+    retention_traces_days: int = Field(30, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    retention_evaluation_results_days: int = Field(90, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    retention_prediction_logs_days: int = Field(30, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    # Counted from the incident's resolution.
+    retention_incidents_days_after_resolution: int = Field(180, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    # Counted from the report's last update.
+    retention_investigation_reports_days_after_update: int = Field(
+        180, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS
+    )
 
     @field_validator("jwt_secret", "csrf_secret", "auth_cookie_domain", "auth_registration_enabled", mode="before")
     @classmethod
