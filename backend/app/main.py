@@ -11,6 +11,7 @@ from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.modules.auth.api import router as auth_router
 from app.modules.health.api import router as health_router
+from app.modules.projects.api import router as projects_router
 
 API_PREFIX = "/api/v1"
 
@@ -48,6 +49,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Operational endpoints live at the root; domain routers are mounted under API_PREFIX.
     app.include_router(health_router)
     app.include_router(auth_router, prefix=API_PREFIX)
+    app.include_router(projects_router, prefix=API_PREFIX)
 
     logger.info("Application created", extra={"environment": settings.env})
     return app

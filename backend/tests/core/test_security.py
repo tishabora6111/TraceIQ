@@ -19,6 +19,7 @@ from pwdlib.hashers.argon2 import Argon2Hasher
 from app.core import security
 from app.core.config import AuthConfigurationError, Settings
 from app.core.security import (
+    API_KEY_LENGTH,
     PASSWORD_MAX_LENGTH,
     PASSWORD_MIN_LENGTH,
     InvalidTokenError,
@@ -27,10 +28,13 @@ from app.core.security import (
     create_access_token,
     create_csrf_token,
     decode_access_token,
+    generate_api_key,
     generate_opaque_token,
+    hash_api_key,
     hash_opaque_token,
     hash_password,
     is_origin_allowed,
+    is_well_formed_api_key,
     normalize_origin,
     request_origin,
     verify_csrf_token,
@@ -375,6 +379,54 @@ def test_missing_jwt_secret_is_a_configuration_error() -> None:
 
 
 # --- Opaque tokens ---------------------------------------------------------------------------
+
+
+def test_api_keys_carry_256_random_bits() -> None:
+    key = generate_api_key()
+    body = key.removeprefix("tiq_")
+    raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+
+    assert key.startswith("tiq_") and len(key) == API_KEY_LENGTH == 47
+    assert len(raw) == 32
+    assert is_well_formed_api_key(key)
+
+
+def test_api_keys_are_unique() -> None:
+    assert len({generate_api_key() for _ in range(1000)}) == 1000
+
+
+def test_api_key_hash_is_sha256_hex() -> None:
+    key = generate_api_key()
+
+    digest = hash_api_key(key)
+
+    assert digest == hashlib.sha256(key.encode()).hexdigest()
+    assert len(digest) == 64 and key not in digest
+    assert hash_api_key(key) == digest
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        None,
+        42,
+        b"tiq_" + b"a" * 43,
+        "",
+        "tiq_",
+        "tiq_" + "a" * 42,
+        "tiq_" + "a" * 44,
+        "TIQ_" + "a" * 43,
+        "xyz_" + "a" * 43,
+        "tiq_" + "a" * 42 + "=",
+        "tiq_" + "a" * 42 + " ",
+        "tiq_" + "a" * 42 + "é",
+        "tiq_" + "a" * 42 + "\n",
+    ],
+)
+def test_malformed_api_keys_are_rejected(key: object) -> None:
+    assert not is_well_formed_api_key(key)
+    with pytest.raises(InvalidTokenError):
+        hash_api_key(key)  # type: ignore[arg-type]
 
 
 def test_opaque_tokens_carry_32_random_bytes() -> None:

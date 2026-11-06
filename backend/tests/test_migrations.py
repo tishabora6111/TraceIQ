@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.database import Base
 from app.modules.auth import models as _auth_models  # noqa: F401
 from app.modules.jobs import models as _jobs_models  # noqa: F401
+from app.modules.projects import models as _projects_models  # noqa: F401
 from tests.conftest import ADMIN_URL, alembic_config, create_database, drop_database
 
 pytestmark = [pytest.mark.db, pytest.mark.usefixtures("database")]
@@ -24,9 +25,11 @@ pytestmark = [pytest.mark.db, pytest.mark.usefixtures("database")]
 BASELINE = "0001_baseline"
 JOBS = "0002_jobs"
 AUTH = "0003_auth"
-HEAD = AUTH
+PROJECTS = "0004_projects"
+HEAD = PROJECTS
 JOB_TABLES = {"jobs", "job_schedules"}
 AUTH_TABLES = {"users", "refresh_tokens"}
+PROJECT_TABLES = {"projects", "project_members", "api_keys"}
 
 
 @pytest.fixture(scope="module")
@@ -85,7 +88,7 @@ def test_upgrade_downgrade_upgrade_cycle(migration_engine: Engine) -> None:
 
     _upgrade(migration_engine, "head")
     assert _current_revision(migration_engine) == HEAD
-    assert JOB_TABLES | AUTH_TABLES <= _tables(migration_engine)
+    assert JOB_TABLES | AUTH_TABLES | PROJECT_TABLES <= _tables(migration_engine)
 
     # Autogenerate finds no difference between the models and the migrated schema.
     _check(migration_engine)
@@ -93,9 +96,9 @@ def test_upgrade_downgrade_upgrade_cycle(migration_engine: Engine) -> None:
 
 def test_auth_downgrade_and_repeated_upgrade(migration_engine: Engine) -> None:
     _upgrade(migration_engine, "head")
-    assert _current_revision(migration_engine) == AUTH
+    assert _current_revision(migration_engine) == HEAD
 
-    # Downgrading auth removes only its tables; the jobs tables stay.
+    # Downgrading auth (and the projects migration that depends on it) leaves the jobs tables.
     _downgrade(migration_engine, JOBS)
     assert _current_revision(migration_engine) == JOBS
     assert _tables(migration_engine) == {"alembic_version"} | JOB_TABLES
@@ -105,7 +108,29 @@ def test_auth_downgrade_and_repeated_upgrade(migration_engine: Engine) -> None:
 
     # Upgrading an up-to-date database is a no-op.
     _upgrade(migration_engine, "head")
+    _upgrade(migration_engine, "head")
+    assert _current_revision(migration_engine) == HEAD
+    _check(migration_engine)
+
+
+def test_projects_downgrade_and_repeated_upgrade(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    assert _current_revision(migration_engine) == PROJECTS
+
+    # Downgrading projects removes only its tables; auth and jobs stay.
+    _downgrade(migration_engine, AUTH)
     assert _current_revision(migration_engine) == AUTH
+    assert _tables(migration_engine) == {"alembic_version"} | JOB_TABLES | AUTH_TABLES
+    with migration_engine.connect() as connection:
+        leftover = connection.execute(
+            text("SELECT indexname FROM pg_indexes WHERE indexname LIKE ANY (ARRAY['%project%', '%api_key%'])")
+        ).all()
+    assert leftover == []
+
+    _upgrade(migration_engine, PROJECTS)
+    assert _tables(migration_engine) == {"alembic_version"} | JOB_TABLES | AUTH_TABLES | PROJECT_TABLES
+    _upgrade(migration_engine, "head")  # no-op
+    assert _current_revision(migration_engine) == PROJECTS
     _check(migration_engine)
 
 
@@ -400,3 +425,123 @@ def test_migrated_revocation_reasons(migration_engine: Engine) -> None:
     for reason in ("rotated", "reuse_detected", "logout", "revoked"):
         assert f"'{reason}'" in definition
     assert definition.count("::character varying") == 4  # exactly four allowed values
+
+
+# --- Projects schema -----------------------------------------------------------------------
+
+
+def _foreign_keys(inspector, table: str) -> dict[str, tuple[list[str], str, str | None]]:  # type: ignore[no-untyped-def]
+    return {
+        fk["name"]: (fk["constrained_columns"], fk["referred_table"], fk["options"].get("ondelete"))
+        for fk in inspector.get_foreign_keys(table)
+    }
+
+
+def test_projects_schema(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    inspector = inspect(migration_engine)
+    columns = {column["name"]: column for column in inspector.get_columns("projects")}
+
+    assert set(columns) == {"id", "name", "description", "retention_overrides", "created_at", "updated_at"}
+    assert {name for name, column in columns.items() if column["nullable"]} == {"description", "retention_overrides"}
+    assert columns["id"]["default"] is None
+    assert (columns["name"]["type"].length, columns["description"]["type"].length) == (100, 1000)
+    assert type(columns["retention_overrides"]["type"]).__name__ == "JSONB"
+    assert columns["created_at"]["type"].timezone and columns["updated_at"]["type"].timezone
+    assert {c["name"] for c in inspector.get_check_constraints("projects")} == {
+        "ck_projects_name_trimmed",
+        "ck_projects_retention_overrides_object",
+    }
+
+
+def test_project_members_schema(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    inspector = inspect(migration_engine)
+    columns = {column["name"]: column for column in inspector.get_columns("project_members")}
+
+    assert set(columns) == {"project_id", "user_id", "role", "created_at", "updated_at"}
+    assert not any(column["nullable"] for column in columns.values())
+    primary_key = inspector.get_pk_constraint("project_members")
+    assert (primary_key["name"], primary_key["constrained_columns"]) == ("pk_project_members", ["project_id", "user_id"])
+    assert _foreign_keys(inspector, "project_members") == {
+        "fk_project_members_project_id_projects": (["project_id"], "projects", "CASCADE"),
+        "fk_project_members_user_id_users": (["user_id"], "users", "RESTRICT"),
+    }
+    assert {c["name"] for c in inspector.get_check_constraints("project_members")} == {"ck_project_members_role"}
+
+
+def test_api_keys_schema(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    inspector = inspect(migration_engine)
+    columns = {column["name"]: column for column in inspector.get_columns("api_keys")}
+
+    assert set(columns) == {
+        "id", "project_id", "name", "prefix", "key_hash", "created_by",
+        "created_at", "last_used_at", "revoked_at", "revoked_by",
+    }  # fmt: skip
+    assert {name for name, column in columns.items() if column["nullable"]} == {
+        "created_by", "last_used_at", "revoked_at", "revoked_by",
+    }  # fmt: skip
+    assert columns["id"]["default"] is None
+    assert (columns["name"]["type"].length, columns["prefix"]["type"].length, columns["key_hash"]["type"].length) == (
+        100,
+        16,
+        64,
+    )
+    for timestamp in ("created_at", "last_used_at", "revoked_at"):
+        assert columns[timestamp]["type"].timezone is True
+    assert _foreign_keys(inspector, "api_keys") == {
+        "fk_api_keys_project_id_projects": (["project_id"], "projects", "CASCADE"),
+        "fk_api_keys_created_by_users": (["created_by"], "users", "SET NULL"),
+        "fk_api_keys_revoked_by_users": (["revoked_by"], "users", "SET NULL"),
+    }
+    assert {c["name"] for c in inspector.get_check_constraints("api_keys")} == {
+        "ck_api_keys_key_hash_format",
+        "ck_api_keys_revoked_by_requires_revoked_at",
+        "ck_api_keys_name_trimmed",
+        "ck_api_keys_prefix_not_empty",
+    }
+    assert {(c["name"], tuple(c["column_names"])) for c in inspector.get_unique_constraints("api_keys")} == {
+        ("uq_api_keys_key_hash", ("key_hash",))
+    }
+
+
+def test_projects_indexes(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    with migration_engine.connect() as connection:
+        index_defs = dict(
+            connection.execute(
+                text(
+                    "SELECT indexname, indexdef FROM pg_indexes"
+                    " WHERE tablename IN ('projects', 'project_members', 'api_keys')"
+                )
+            ).all()
+        )
+
+    assert set(index_defs) == {
+        "pk_projects",
+        "pk_project_members",
+        "ix_project_members_user_id",
+        "uq_project_members_owner",
+        "pk_api_keys",
+        "uq_api_keys_key_hash",
+        "ix_api_keys_project_id",
+        "ix_api_keys_created_by",
+        "ix_api_keys_revoked_by",
+    }
+    owner = index_defs["uq_project_members_owner"]
+    assert owner.startswith("CREATE UNIQUE INDEX") and "(project_id)" in owner
+    assert "WHERE ((role)::text = 'owner'::text)" in owner
+    assert index_defs["uq_api_keys_key_hash"].startswith("CREATE UNIQUE INDEX")
+
+
+def test_project_member_roles_are_exactly_the_approved_values(migration_engine: Engine) -> None:
+    _upgrade(migration_engine, "head")
+    with migration_engine.connect() as connection:
+        definition = connection.execute(
+            text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_project_members_role'")
+        ).scalar_one()
+
+    for role in ("owner", "admin", "member"):
+        assert f"'{role}'" in definition
+    assert definition.count("::character varying") == 3

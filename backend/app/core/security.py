@@ -7,6 +7,7 @@ Domain-free; the auth module builds on these. Nothing here logs or returns secre
 * Access tokens: HS256 JWTs via PyJWT. Decoding accepts only HS256 and requires every claim this
   module issues.
 * Opaque tokens (refresh tokens): 32 random bytes; only their SHA-256 digest is stored.
+* API keys: ``tiq_`` + 32 random bytes; only their SHA-256 digest is stored.
 * CSRF tokens: ``<nonce>.<HMAC-SHA256(csrf_secret, session id + nonce)>``, bound to a session
   (refresh-token family); compared in constant time.
 * Origin validation: exact scheme/host/port match against the configured allowlist.
@@ -237,6 +238,39 @@ def hash_opaque_token(token: str) -> str:
     if not isinstance(token, str) or not token or len(token) > _MAX_OPAQUE_TOKEN_LENGTH:
         raise InvalidTokenError("Invalid token")
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# --- API keys --------------------------------------------------------------------------------
+
+# A key is ``tiq_`` followed by 32 random bytes (256 bits) in URL-safe base64 without padding.
+API_KEY_PREFIX = "tiq_"
+API_KEY_BYTES = 32
+API_KEY_LENGTH = len(API_KEY_PREFIX) + 43
+# Characters shown in listings so users can tell keys apart: the marker plus 8 random characters.
+API_KEY_DISPLAY_PREFIX_LENGTH = 12
+_API_KEY_BODY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def generate_api_key() -> str:
+    return API_KEY_PREFIX + secrets.token_urlsafe(API_KEY_BYTES)
+
+
+def is_well_formed_api_key(key: object) -> bool:
+    """Shape check only (marker, length, alphabet), so malformed input never reaches the database."""
+    return (
+        isinstance(key, str)
+        and len(key) == API_KEY_LENGTH
+        and key.startswith(API_KEY_PREFIX)
+        and set(key[len(API_KEY_PREFIX) :]) <= _API_KEY_BODY_CHARS
+    )
+
+
+def hash_api_key(key: str) -> str:
+    """SHA-256 hex digest used to store and look up API keys. No pepper (ARCHITECTURE D20): like refresh
+    tokens, a key carries 256 random bits, so a fast unsalted hash cannot be brute-forced."""
+    if not is_well_formed_api_key(key):
+        raise InvalidTokenError("Invalid API key")
+    return hashlib.sha256(key.encode("ascii")).hexdigest()
 
 
 # --- CSRF tokens -----------------------------------------------------------------------------
