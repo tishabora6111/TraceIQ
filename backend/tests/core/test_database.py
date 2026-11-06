@@ -125,6 +125,32 @@ def test_engine_hides_sql_parameters() -> None:
     assert get_engine().hide_parameters is True
 
 
+def test_request_sessions_use_read_committed() -> None:
+    """Authorization re-checks under a row lock depend on it (see core/database.get_engine)."""
+    session_gen = get_db()
+    session = next(session_gen)
+    try:
+        assert session.scalar(text("SHOW transaction_isolation")) == "read committed"
+        assert session.connection().get_isolation_level() == "READ COMMITTED"
+    finally:
+        session_gen.close()
+
+
+def test_read_committed_is_set_explicitly_not_inherited() -> None:
+    """A server or role default of REPEATABLE READ must not leak into application sessions."""
+    session_gen = get_db()
+    session = next(session_gen)
+    try:
+        session.execute(text("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        session.commit()
+        # The engine sets the level at the start of every transaction on this connection.
+        assert session.scalar(text("SHOW transaction_isolation")) == "read committed"
+    finally:
+        session.execute(text("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+        session.commit()
+        session_gen.close()
+
+
 def test_database_error_does_not_contain_parameter_values() -> None:
     exc = _database_error_with_sensitive_parameter()
 

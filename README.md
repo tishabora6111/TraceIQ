@@ -4,11 +4,11 @@
 
 TraceIQ gives engineering teams visibility into LLM applications, RAG pipelines, and machine learning models in production: trace every step, measure quality, track cost, and detect drift — in one place.
 
-> **Project status: early development.** The architecture and documentation are complete. No application features are implemented yet. See the [roadmap](docs/ROADMAP.md) for progress.
+> **Project status: early development (M1 – Foundation in progress).** Implemented and tested: the backend and worker skeleton, background jobs, authentication (sign-in, refresh-token rotation, CSRF and Origin protection), and projects with roles, ownership transfer, retention settings and API-key management. Still outstanding in M1: the storage abstraction and CI. The observability features below are not implemented yet; trace ingestion, the first use of API keys, arrives in M2. See the [roadmap](docs/ROADMAP.md).
 
 ## Features
 
-All features below are **planned**.
+All features below are **planned**; none is implemented yet.
 
 ### LLM and RAG observability (first)
 - **Tracing** – nested traces and spans for LLM calls, retrieval, tools, and chains.
@@ -81,6 +81,45 @@ All settings are in `.env.example` and are passed only to the `api` service.
 | `TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS` | `10` | How long a login waits for hashing capacity before returning 503. |
 
 The auth endpoints are under `/api/v1/auth`: `register`, `login`, `refresh`, `logout` and `me`. Details are in [docs/ARCHITECTURE.md §7](docs/ARCHITECTURE.md).
+
+### Projects API
+Projects are under `/api/v1/projects`. Every request needs a bearer access token, and every write also needs an allowed Origin.
+
+| Endpoint | Who |
+|---|---|
+| `POST /projects` | any signed-in user; the creator becomes the Owner |
+| `GET /projects` | lists your projects; `limit` up to 100, plus `offset` |
+| `GET /projects/{id}` | any member |
+| `PATCH /projects/{id}` | Owner or Admin |
+| `DELETE /projects/{id}` | the Owner only; the body must be `{"confirm_name": "<exact project name>"}` |
+| `GET /projects/{id}/members` | any member |
+| `POST /projects/{id}/members` | Owner or Admin; `{email, role}` adds an existing registered user as `admin` or `member` |
+| `PATCH /projects/{id}/members/{user_id}` | Owner or Admin; never the Owner's own membership |
+| `DELETE /projects/{id}/members/{user_id}` | Owner or Admin removes others; any member except the Owner can leave |
+| `POST /projects/{id}/ownership-transfer` | the Owner only; `{user_id}` of an active member, who becomes the Owner while you become an Admin |
+| `GET /projects/{id}/retention` | any member; effective periods, overrides and configured defaults |
+| `PATCH /projects/{id}/retention` | Owner or Admin; partial update, `null` resets a period to its default |
+| `POST /projects/{id}/api-keys` | Owner or Admin; `{name}` creates a key and returns it once |
+| `GET /projects/{id}/api-keys` | Owner or Admin; metadata only, revoked keys included |
+| `POST /projects/{id}/api-keys/{key_id}/revoke` | Owner or Admin; permanent, and repeating it changes nothing |
+
+Non-members get 404, as if the project did not exist. The Owner must transfer ownership before leaving. An Owner whose account is deactivated cannot transfer ownership; administrative recovery is not implemented yet. See [docs/ARCHITECTURE.md §7.3](docs/ARCHITECTURE.md).
+
+#### Retention
+Defaults come from the `TRACEIQ_RETENTION_*` settings in `core/config`: traces 30 days, evaluation results 90, prediction logs 30, incidents 180 after resolution, investigation reports 180 after their last update. A project can override each one with a whole number of days from 1 to 3650, for example `{"traces_days": 7, "prediction_logs_days": null}`. Only the fields you send change, `null` removes that override, and an empty body is rejected; send every field as `null` to reset them all.
+
+Both retention endpoints return `effective` (the periods that apply to this project), `overrides` (the project's own values, `null` where none is set), `defaults` (the configured `TRACEIQ_RETENTION_*` values, the same for every project) and `model_artifacts: "until_manually_deleted"`. Model artifacts are kept until manually deleted and can't be overridden. Automatic deletion jobs are planned and not running yet.
+
+Docker Compose doesn't pass `TRACEIQ_RETENTION_*` variables to the containers yet, and they aren't in `.env.example`, so under Docker the defaults above always apply; setting them in `.env` has no effect. They take effect only when the backend runs with those variables in its own environment.
+
+#### API keys
+API keys will authenticate ingestion clients once the ingestion API exists (M2); today you can create, list and revoke them.
+
+- **Shown once.** The creation response (sent with `Cache-Control: no-store`) is the only place the full key ever appears. Copy it then: it can't be retrieved later. A lost key must be revoked and replaced.
+- **Stored hashed.** Keys look like `tiq_` plus 43 random characters (256 bits). TraceIQ stores only their SHA-256 hash and a 12-character prefix for telling keys apart; listings never include the key or its hash.
+- **Revocation** is immediate and permanent. Revoked keys stay listed with `is_active: false`.
+- **Limit:** 25 active keys per project; revoked keys don't count.
+- Members can't see or manage keys. Key names are trimmed and must be 1–100 characters.
 
 ## Documentation
 
