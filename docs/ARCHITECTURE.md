@@ -1,6 +1,6 @@
 # TraceIQ – Architecture
 
-**Status:** Approved design · **Implementation status:** Not started
+**Status:** Approved design · **Implementation status:** M1 – Foundation in progress. Implemented: `core` (except storage), `health`, `jobs` and the worker, `auth`, `projects`. Planned: `core/storage` (§9) and every later module. Sections say where they describe implemented behaviour.
 
 ## 1. Architectural Style
 
@@ -46,7 +46,9 @@ TraceIQ is a **modular monolith**: one backend codebase and one database, intern
 
 No Redis, Celery, or message broker is used initially; PostgreSQL serves as the job queue.
 
-## 3. Repository Layout (planned)
+## 3. Repository Layout
+
+Target layout. Present today: `main.py`, `worker.py`, `core/` (without storage), `modules/auth`, `modules/health`, `modules/jobs`, `modules/projects`, `alembic/`, `tests/`, and the frontend skeleton. The other modules, `sdk/` and `.github/workflows/` are planned.
 
 ```
 backend/
@@ -110,6 +112,8 @@ modules/<name>/
 
 **Rules**
 - Cross-module calls go through `service.py` only. No cross-module imports of `models.py` or `repository.py`.
+- Exception: a module's `dependencies.py` is also public, for the FastAPI dependencies other modules' routers need. Examples: `auth.dependencies.CurrentUser` and `require_allowed_origin_for_writes`; from M1.4, `projects.dependencies.require_project_role`.
+- `auth.service` provides read-only user lookups for other modules: `get_users(user_ids)` (one query, keyed by id) and `find_user_by_email(email)`. Both return `UserRead` (no hashes or token data), so no module reads the `users` table directly.
 - Dependencies point in one direction as listed; cycles are not allowed.
 - A module writes only to its own tables, including during retention cleanup.
 - `providers` is the only place that imports vendor LLM SDKs or calls provider HTTP APIs.
@@ -159,6 +163,28 @@ The worker periodically runs an alert-evaluation job that checks rules against m
 ### 5.7 Retention
 A scheduled job per data-owning module deletes records older than the project's retention period. Global defaults are set in configuration; projects may override them.
 
+| Setting | Default (days) |
+|---|---|
+| `TRACEIQ_RETENTION_TRACES_DAYS` | 30 |
+| `TRACEIQ_RETENTION_EVALUATION_RESULTS_DAYS` | 90 |
+| `TRACEIQ_RETENTION_PREDICTION_LOGS_DAYS` | 30 |
+| `TRACEIQ_RETENTION_INCIDENTS_DAYS_AFTER_RESOLUTION` | 180 |
+| `TRACEIQ_RETENTION_INVESTIGATION_REPORTS_DAYS_AFTER_UPDATE` | 180 |
+
+- Every period, default or project override, must be between 1 and 3650 days (`MIN_RETENTION_DAYS`, `MAX_RETENTION_DAYS` in `core/config`).
+- Model artifacts have no setting: they are kept until manually deleted, and no project can override that. Unresolved incidents are never deleted.
+- **Per-project overrides** (implemented in M1.4) are stored in `projects.retention_overrides` and managed through `GET`/`PATCH /api/v1/projects/{project_id}/retention` (§7.3). The effective period is the project's override where one is set, otherwise the configured default, so changing a default affects every project without an override for it.
+
+| Override key | Default from |
+|---|---|
+| `traces_days` | `TRACEIQ_RETENTION_TRACES_DAYS` |
+| `evaluation_results_days` | `TRACEIQ_RETENTION_EVALUATION_RESULTS_DAYS` |
+| `prediction_logs_days` | `TRACEIQ_RETENTION_PREDICTION_LOGS_DAYS` |
+| `incidents_days_after_resolution` | `TRACEIQ_RETENTION_INCIDENTS_DAYS_AFTER_RESOLUTION` |
+| `investigation_reports_days_after_update` | `TRACEIQ_RETENTION_INVESTIGATION_REPORTS_DAYS_AFTER_UPDATE` |
+
+Retention cleanup jobs are planned with each data-owning module; none exists yet.
+
 | Data | Owner module | Default | Measured from |
 |---|---|---|---|
 | Traces (with spans, retrieved documents) | `tracing` | 30 days | `started_at` |
@@ -200,14 +226,43 @@ Implemented in `backend/app/modules/jobs/` (M1.2). PostgreSQL is the only queue:
 ### 7.1 Authentication
 - **Users:** email/password. Passwords hashed with Argon2id via pwdlib; plaintext never stored or logged.
 - **Access tokens:** JWTs created and verified with PyJWT, signed with a secret from configuration, 15-minute lifetime. Held in frontend memory only; sent as `Authorization: Bearer`.
-- **Refresh tokens:** opaque random tokens, 7-day lifetime, stored hashed in `refresh_tokens`. Each use rotates the token (old one revoked, new one issued in the same family). Reuse of a revoked token revokes the whole family. Logout and password change revoke server-side.
-- **Ingestion API:** per-project API keys, stored hashed and shown once at creation.
+- **Refresh tokens:** opaque random tokens (32 bytes), stored only as SHA-256 hashes in `refresh_tokens`.
+  - **Lifetimes:** each token has a 7-day rolling lifetime (`TRACEIQ_REFRESH_TOKEN_TTL_SECONDS`). Every token of a login's family also carries the family's **absolute lifetime of 30 days from login** (`TRACEIQ_REFRESH_TOKEN_ABSOLUTE_TTL_SECONDS`). A rotated token's rolling expiry is capped at that deadline, so a session cannot be extended past it by refreshing.
+  - **Rotation:** each refresh revokes the presented token (`rotated`, with `replaced_by_id`) and issues its replacement in the same family, atomically.
+  - **Reuse detection** (strict): presenting a revoked token revokes every token in its family (`reuse_detected`), which also ends any access tokens of that session. Two concurrent refreshes with the same token therefore succeed once, then end the session, so the frontend must serialize refreshes.
+  - **Concurrency:** rotation, logout and account-wide revocation lock the user's row (`SELECT … FOR UPDATE`) before re-reading the token, so changes to one user's sessions are serialized and none can miss another's replacement token.
+  - **Revocation reasons:** `logout` (one family), `revoked` (all of a user's families: `revoke_all_sessions()`, for password changes or compromised accounts), `reuse_detected`, `rotated`.
+- **Endpoints** (implemented):
+  - `POST /api/v1/auth/register` creates an active user (201) and does not log in. A duplicate email returns 409. Registration is enabled in development and test and disabled in production unless `TRACEIQ_AUTH_REGISTRATION_ENABLED` overrides it (403 when disabled).
+  - `POST /api/v1/auth/login` returns `{access_token, token_type, expires_in, csrf_token, user}` with `Cache-Control: no-store`, sets the refresh and CSRF cookies (§7.2), starts a new refresh-token family, and sets `last_login_at`. Unknown email, wrong password and inactive account all return the same 401 after the same Argon2id work.
+  - Both require an allowed Origin (§7.2). Emails are trimmed and lower-cased before validation and storage.
+  - `POST /api/v1/auth/refresh` reads the refresh token only from its cookie. It requires an allowed Origin and a valid CSRF token (§7.2), rotates the token and returns the same body as login, with new cookies.
+    - Missing, unknown or expired tokens, and inactive or deleted users, return 401 with nothing changed.
+    - A reused token returns 401 after revoking its family.
+    - A CSRF failure returns 403 and never triggers reuse detection, so a request without the CSRF token cannot end someone's session.
+  - `POST /api/v1/auth/logout` revokes the presented token's whole family (`logout`) and clears both cookies with their original name, path, domain and flags (204, `Cache-Control: no-store`).
+    - It requires an allowed Origin, and a valid CSRF token when the presented token is known.
+    - With no cookie, an unknown token, or an already revoked or expired session it still returns 204, so it is safe to repeat.
+  - `GET /api/v1/auth/me` returns the current user (`Cache-Control: no-store`).
+  - Login and registration return 503 `authentication_busy` (with `Retry-After`) when no hashing capacity frees up within `TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS` (default 10). The response is the same for every account.
+- **Current-user dependency** (`get_current_user`, used by `/me` and future protected routes):
+  - It reads the token only from `Authorization: Bearer` (scheme case-insensitive), never from cookies or query parameters, and verifies it as above.
+  - It then requires that the user exists and is active, and that the token's session is still active. The session is the refresh-token family named by `sid`. It is active when it belongs to the same user and has at least one token that is unrevoked and within both its rolling and absolute expiry.
+  - So logout and reuse detection take effect immediately instead of when the access token expires. This costs one indexed lookup per request.
+  - Every failure returns the same 401 (`Not authenticated.`, `WWW-Authenticate: Bearer`). The reason is logged without the token.
+- **Startup:** the API refuses to start unless `TRACEIQ_JWT_SECRET` and `TRACEIQ_CSRF_SECRET` are set, at least 32 bytes, non-placeholder and different, and (in production) unless `TRACEIQ_AUTH_COOKIE_SECURE` is true. The worker does not need the secrets: Docker Compose passes them to the `api` service only. An empty `TRACEIQ_CORS_ORIGINS` logs a startup warning, since every login and registration would then be rejected.
+- **Hashing load:** at most `TRACEIQ_AUTH_MAX_CONCURRENT_HASHES` (default 4, allowed 1–64) Argon2id operations (64 MiB each) run at once per process; real and dummy verifications share the bound, so timing stays uniform.
+- **Logging:** database error messages are never logged, because PostgreSQL's `DETAIL` can contain row values (emails, hashes). Logs carry only the driver error class, SQLSTATE and constraint name, including for database errors nested in exception chains, exception groups and `extra` containers. Job errors stored in `jobs.last_error` follow the same rule. If a record cannot be formatted, the JSON formatter emits only timestamp, level, logger name, `"<log formatting failed>"` and the formatting error's class name. If writing a log line fails, only a fixed notice naming the error class goes to stderr; the record itself is never printed.
+- **Ingestion API:** per-project API keys, stored hashed and shown once at creation. Key management is implemented (§7.3); the ingestion endpoints that will accept keys arrive in M2.
 - **Python SDK** (later milestone) authenticates with project API keys over the same REST API.
 
 ### 7.2 Cookies and CSRF
-- **Refresh cookie:** `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/api/v1/auth`. Never readable by JavaScript and never sent to other API paths.
-- **CSRF token (signed double-submit):** issued at login and on each refresh as an HMAC-signed value bound to the refresh-token family, set in a separate non-HttpOnly `Secure`, `SameSite=Lax` cookie. The frontend sends it in the `X-CSRF-Token` header. The server requires header and cookie to match and the signature to verify. Required on all cookie-authenticated endpoints (refresh, logout).
+- **Refresh cookie:** `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/api/v1/auth`. Never readable by JavaScript and never sent to other API paths. `Secure` can be turned off only outside production; configuration loading rejects `TRACEIQ_AUTH_COOKIE_SECURE=false` with `TRACEIQ_ENV=production`.
+- **CSRF token (signed double-submit):** issued at login and on each refresh as an HMAC-signed value bound to the refresh-token family, set in a separate non-HttpOnly `Secure`, `SameSite=Lax` cookie. The frontend sends it in the `X-CSRF-Token` header. The server requires header and cookie to match and the signature to verify for the family of the presented refresh token. A token of another session, a forged signature, or an old header replayed after rotation (the cookie holds the new token) are rejected with 403 `csrf_failed`. Required on all cookie-authenticated endpoints (refresh, logout); bearer-only requests such as `GET /me` need no CSRF token.
 - **Origin validation:** the `Origin` header (falling back to `Referer`) is checked against a configured allowlist on login, refresh, logout, and all JWT-authenticated state-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`). API-key ingestion endpoints are exempt, as they serve non-browser clients.
+  - JWT-authenticated routers declare `require_allowed_origin_for_writes` as a router-level dependency, so every write route, including ones added later, is covered.
+  - It checks every method except GET, HEAD, OPTIONS and TRACE, and runs before authentication.
+  - It never replaces authentication: routes still declare `CurrentUser`.
 - **Deployment assumption:** frontend and API are served from the same site. A cross-site deployment would need `SameSite=None` (with `Secure`), credentialed CORS, and a review of the CSRF controls; the SameSite policy is therefore configurable.
 
 ### 7.3 Authorization
@@ -219,11 +274,100 @@ Project roles are stored in `project_members` and enforced by the shared project
 | Trace and evaluation operations (datasets, evaluation runs) | ✓ | ✓ | ✓ |
 | Incidents and investigation reports (view, update status, run AI drafting, edit, approve) | ✓ | ✓ | ✓ |
 | Project settings (retention, API keys, detector thresholds) | ✓ | ✓ | — |
-| Member management (invite, remove, assign Admin/Member) | ✓ | ✓ | — |
+| View retention settings | ✓ | ✓ | ✓ |
+| Member management (add existing users, remove, assign Admin/Member) | ✓ | ✓ | — |
+| List members | ✓ | ✓ | ✓ |
+| Leave the project | — (transfer first) | ✓ | ✓ |
 | Delete project | ✓ | — | — |
 | Transfer ownership | ✓ | — | — |
 
 Admins cannot change or remove the Owner.
+
+**Enforcement** (implemented in M1.4 for project CRUD, memberships, ownership transfer, retention settings and API keys):
+- **Project-role dependency:** `projects.dependencies.require_project_role(minimum)` returns `ProjectAccess{project_id, user_id, role}` for the `{project_id}` path parameter and the current user.
+  - Role order: Member < Admin < Owner.
+  - **Non-members get 404 `project_not_found`, the same as for a missing project,** so project existence is never revealed. Members below the minimum get 403 `insufficient_project_role`.
+  - Shortcuts: `ProjectMemberAccess`, `ProjectAdminAccess`, `ProjectOwnerAccess`.
+- **Writes re-check under a lock:** the dependency reads the caller's role before the service takes any lock, so every write service locks the project row (`SELECT … FOR UPDATE`) and re-checks the caller's role. A role that was demoted or removed in the meantime is refused.
+- **Isolation requirement: READ COMMITTED.** The dependency's read and the service's re-check run in the *same* transaction (one request session). Under READ COMMITTED each statement sees the latest committed data, so the re-check after the lock sees a concurrent demotion. Under REPEATABLE READ or SERIALIZABLE it would re-read the transaction's earlier snapshot and act on a stale role. `core/database.get_engine` therefore sets `isolation_level="READ COMMITTED"` explicitly rather than relying on the server default. Tests:
+  - request sessions report `read committed`, even when the connection's session default was changed;
+  - over HTTP, an Admin demoted by another session between the dependency and the lock is refused on every Admin write route. These tests fail if the engine is switched to REPEATABLE READ.
+- **Permission matrix suite** (`tests/projects/test_permission_matrix.py`): every projects route against Owner, Admin, Member, a non-member, the member of another project, an inactive caller and no token. Refused calls must leave the project unchanged. Every write is also refused without an allowed Origin.
+  - **Route-inventory guard:** the suite fails if a projects route is added without a matrix row, if a route lacks `CurrentUser`, `require_allowed_origin_for_writes` or the expected `require_project_role` minimum, or if any route in the app with a `{project_id}` path parameter lacks a project-role check.
+- **Router-wide checks:** the projects router declares `require_allowed_origin_for_writes`, and every route requires `CurrentUser`. All project queries are scoped through the caller's membership.
+
+**Project endpoints** (`/api/v1/projects`, bearer token required):
+
+| Method and path | Who | Behaviour |
+|---|---|---|
+| `POST /projects` | any active user | `{name, description?}` → 201 `ProjectRead`; the project and the caller's Owner membership are created in one transaction |
+| `GET /projects` | any active user | The caller's projects only, `[ProjectSummary{id, name, role, created_at}]`, ordered by name; `limit` 1–100 (default 50), `offset` ≥ 0 |
+| `GET /projects/{project_id}` | Member+ | `ProjectRead{id, name, description, role, created_at, updated_at}`, where `role` is the caller's |
+| `PATCH /projects/{project_id}` | Admin+ | Partial update of `name` and/or `description`; `description: null` clears it; an empty body or `name: null` returns 422 |
+| `DELETE /projects/{project_id}` | Owner | Body `{"confirm_name": "<exact current name>"}` (a mismatch returns 422 `confirmation_mismatch`) → 204. Memberships and API keys are deleted with it (database cascade). The confirmation goes in the body, not the URL, so the name never reaches access logs. |
+
+- **Names** are trimmed with Python's `str.strip()`, which also removes Unicode whitespace such as U+00A0, and must then be 1–100 characters. The database check on names is an ASCII-whitespace backstop.
+- **Descriptions** are trimmed, at most 1000 characters, and an empty one is stored as null.
+- **Unknown request fields** are rejected (422).
+
+**Membership endpoints** (`/api/v1/projects/{project_id}/members`):
+
+| Method and path | Who | Behaviour |
+|---|---|---|
+| `GET /members` | Member+ | `[MemberRead{user_id, email, role, is_active, created_at}]`: Owner first, then Admins, then Members, each by email. Two queries however many members (memberships, then one batched `auth.service.get_users` lookup). Members whose account was later deactivated stay listed with `is_active: false`. |
+| `POST /members` | Admin+ | `{email, role: admin or member}` → 201 `MemberRead`. Only existing registered users, found by email normalized as at registration. Unknown email → 404 `user_not_found`; inactive account → 409 `user_inactive`; already a member → 409 `already_member`; `role: owner` → 422. |
+| `PATCH /members/{user_id}` | Admin+ | `{role: admin or member}` → `MemberRead`. The Owner's membership never changes here (409 `owner_role_change_forbidden`), and nobody is promoted to Owner (422). Admins may change other Admins and demote themselves. Not a member of this project → 404 `member_not_found`. |
+| `DELETE /members/{user_id}` | Admin+ for others; anyone but the Owner for themselves | → 204. A Member removing someone else gets 403. Removing or leaving as the Owner gets 409 `owner_role_change_forbidden` (transfer ownership first). A repeated removal gets 404 `member_not_found`. |
+
+- **Membership invariants:** every membership change locks the project row and re-checks the caller's role and membership against committed state.
+  - A concurrently demoted Admin is refused (tested by holding the lock while demoting).
+  - Of two concurrent adds of the same user, one gets `already_member`.
+  - Of two concurrent removals of the same member, one gets `member_not_found`.
+  - An Admin removed by a concurrent request can no longer act.
+  - The Owner is never removed, demoted or duplicated, so each project keeps exactly one Owner.
+- **Scoping:** memberships are always looked up by `(project_id, user_id)`. A user who belongs only to another project is 404 here.
+
+**Ownership transfer** (`POST /api/v1/projects/{project_id}/ownership-transfer`, Owner only; Admins and Members get 403, non-members 404):
+- **Request and response:** request `{user_id}`; response `{new_owner: MemberRead, previous_owner: MemberRead}`. The previous Owner becomes **Admin** (D19).
+- **Checks, under the project-row lock:**
+  - The caller must still be the Owner (403 if ownership moved, 404 if they are no longer a member).
+  - The target must be a member of *this* project (404 `member_not_found`, the same for non-members of every kind, so other projects' memberships never leak).
+  - The target's account must be active (409 `user_inactive`).
+  - The target can't be the caller (409 `ownership_transfer_to_self`).
+- **Order of changes:** two `UPDATE` statements in one transaction, demoting the Owner first and then promoting the target. The partial unique Owner index is checked per statement and is never bypassed. No membership is deleted or recreated, and any failure, including after the demotion, rolls back both.
+- **Concurrency:** of two concurrent transfers by the same Owner, one succeeds and the other is refused, because the caller is then only an Admin. A transfer racing the target's removal waits for the lock and then finds no member.
+- **Account details:** projects never reads the `users` table. Emails and account state come from `auth.service` (`find_user_by_email`, `get_users`) as `UserRead`, with no hashes or tokens.
+- **Known limitation: deactivated Owner.** A deactivated account cannot sign in, so an Owner whose account is deactivated cannot transfer ownership through this endpoint, and nobody else can. The project keeps its Owner, and its Admins keep managing it, but deletion and transfer are unavailable. Administrative recovery (reassigning ownership without the Owner) is not implemented yet.
+
+**Retention settings** (`/api/v1/projects/{project_id}/retention`):
+
+| Method and path | Who | Behaviour |
+|---|---|---|
+| `GET /retention` | Member+ | `RetentionRead{project_id, effective, overrides, defaults, model_artifacts}`. All three objects list the five periods in days: `effective` is what applies to this project (override if set, else default); `overrides` is the project's own values, `null` where the default applies; `defaults` is the configured `TRACEIQ_RETENTION_*` values, identical for every project. `model_artifacts` is always `"until_manually_deleted"`. PATCH returns the same shape. |
+| `PATCH /retention` | Admin+ (Members 403, non-members 404) | Partial update → `RetentionRead`. Only the fields sent change; a field set to `null` removes that override, so its default applies again. Sending all five as `null` is the reset-all operation. |
+
+- **Validation (422):** each value must be a JSON integer from 1 to 3650 inclusive. Booleans, numeric strings and floats (including `30.0`) are rejected, not coerced. Unknown fields are rejected, including `model_artifacts`, which cannot be overridden. An empty body `{}` is rejected, as for `PATCH /projects/{id}`; it never resets anything.
+- **Storage:** the service merges the changes into the stored overrides under the project-row lock, after re-checking that the caller is still Owner or Admin, and commits in one transaction; any failure leaves the stored overrides unchanged. Keys are written sorted. When no override remains, the column becomes SQL NULL. A stored empty object also means "all defaults".
+- **Invalid stored values:** entries the API could not have written (unknown keys, non-integers, booleans, out-of-range numbers, e.g. from a manual database edit) are ignored, so the default applies, and a warning with the project id and the number of ignored entries is logged. The next successful update drops them.
+- **Concurrency:** concurrent updates of different periods are serialized by the lock and both kept. An Admin demoted while waiting for the lock is refused.
+- **Isolation:** overrides belong to one project row; the route and the service only ever read and write the `{project_id}` the caller's membership was verified for.
+
+**API keys** (`/api/v1/projects/{project_id}/api-keys`; Owner or Admin for every route, Members 403, non-members 404):
+
+| Method and path | Behaviour |
+|---|---|
+| `POST /api-keys` | `{name}` → 201 `ApiKeyCreated`: the `ApiKeyRead` fields plus `key`, the full key. Sent with `Cache-Control: no-store` and `Pragma: no-cache`. A 26th active key → 409 `api_key_limit_reached`. |
+| `GET /api-keys` | `[ApiKeyRead{id, name, prefix, is_active, created_by, created_at, last_used_at, revoked_at, revoked_by}]`, revoked keys included, newest first; `limit` 1–100 (default 50), `offset` ≥ 0. |
+| `POST /api-keys/{api_key_id}/revoke` | → 200 `ApiKeyRead`. The key is kept for audit and never authenticates again. Revoking an already revoked key changes nothing and returns it unchanged. A key that doesn't exist or belongs to another project → 404 `api_key_not_found`. |
+
+- **Key format:** `tiq_` followed by 32 bytes (256 bits) from `secrets.token_urlsafe`, 47 characters in all (`core/security.generate_api_key`). `prefix` is the first 12 characters (`tiq_` plus 8 random ones) so users can tell keys apart.
+- **Storage:** only the SHA-256 hex digest is stored (`key_hash`, unique), with no pepper: 256 random bits cannot be brute-forced, the same reasoning as for refresh tokens. The full key appears in the creation response and nowhere else: never in listings, revocation responses, logs or the database. No response ever contains `key_hash`.
+- **Names:** trimmed with `str.strip()` like project names, then 1–100 characters; duplicates are allowed. Unknown fields (including `key`, `key_hash`, `prefix`) are rejected (422).
+- **Active-key limit:** at most 25 unrevoked keys per project; revoked keys don't count. Creation counts active keys while holding the project-row lock, which every creation takes, so concurrent creations can't exceed the limit (tested with four creations racing for the last slot).
+- **Writes re-check under the lock:** creation and revocation lock the project row and re-check that the caller is still Owner or Admin. Listing is read-only and checks the role in both the dependency and the service.
+- **Isolation:** keys are always looked up by `(project_id, api_key_id)`, so another project's key is 404 through this project. A key belongs to the project, not its creator: it keeps working if the creator leaves, until it is revoked or the project is deleted (the keys are deleted with it).
+- **Logging:** create and revoke log project, user and key ids only; never the key, its prefix, its hash or its name.
+- **Authentication (service only, for M2):** `projects.service.authenticate_api_key(session, key)` returns `ApiKeyPrincipal{project_id, api_key_id}` or None. It rejects malformed input before touching the database, then looks up the SHA-256 digest among unrevoked keys through the unique index, so revoked, unknown and deleted-project keys all return None. It is read-only and does not yet update `last_used_at`, which stays null until ingestion sets it. No route accepts API keys yet: management routes take only user bearer tokens, and presenting an API key there gets 401.
 
 ## 8. LLM Provider Abstraction
 
@@ -242,6 +386,8 @@ LLMResponse: text, input_tokens, output_tokens, latency_ms, raw_metadata
 
 ## 9. Storage Abstraction
 
+**Planned** (M1, not implemented yet).
+
 ```
 Storage (interface)
   save(key, data) -> uri
@@ -259,11 +405,11 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 ### 10.1 Platform
 | Table | Key columns |
 |---|---|
-| `users` | id, email (unique), password_hash, is_active, created_at, last_login_at |
-| `refresh_tokens` | id, user_id → users, family_id, token_hash, expires_at, revoked_at, replaced_by_id, created_at |
-| `projects` | id, name, description, retention_overrides JSONB (null = config defaults), created_at |
-| `project_members` | project_id → projects, user_id → users, role (owner / admin / member), created_at; PK (project_id, user_id) |
-| `api_keys` | id, project_id → projects, key_hash, prefix, revoked_at |
+| `users` | id (UUID, generated in Python), email (unique; stored trimmed and lower-cased, CHECK: no upper case or whitespace, contains `@` after a local part; max 320), password_hash (Argon2id, non-empty), is_active, created_at, updated_at, last_login_at |
+| `refresh_tokens` | id (UUID, generated in Python), user_id → users (`CASCADE` on delete), family_id (one per login session), token_hash (unique SHA-256 hex, CHECK 64 lower-case hex characters), expires_at (rolling), absolute_expires_at (fixed per family; CHECK `expires_at <= absolute_expires_at`), revoked_at, revocation_reason (rotated / reuse_detected / logout / revoked, where `revoked` covers account-wide and security-driven revocation such as revoking all sessions or a password change; set exactly when revoked_at is set), replaced_by_id → refresh_tokens (unique, `SET NULL` on delete, only on `rotated` tokens, never the token itself), created_at |
+| `projects` | id (UUID, generated in Python), name (max 100; CHECK non-empty, no leading or trailing whitespace), description (max 1000, nullable), retention_overrides JSONB (SQL NULL = config defaults; CHECK a JSON object when set; keys and 1–3650-day bounds validated by the service, see §5.7 and §7.3), created_at, updated_at |
+| `project_members` | project_id → projects (`CASCADE` on delete), user_id → users (`RESTRICT` on delete: a member cannot be deleted), role (CHECK owner / admin / member), created_at, updated_at; PK (project_id, user_id). At most one Owner per project (partial unique index); "at least one Owner" is enforced by the service under a project-row lock, and a transfer demotes the old Owner before promoting the new one in one transaction |
+| `api_keys` | id (UUID, generated in Python), project_id → projects (`CASCADE` on delete), name (max 100; CHECK non-empty, trimmed), prefix (max 16, non-empty; the key's first 12 characters, shown in listings), key_hash (unique SHA-256 hex, CHECK 64 lower-case hex characters; the key itself is never stored), created_by → users (`SET NULL` on delete, nullable), created_at, last_used_at (nullable; set by ingestion), revoked_at (nullable; revoked keys are kept), revoked_by → users (`SET NULL` on delete; CHECK set only when revoked_at is set) |
 | `jobs` | id (UUID, generated in Python), type, status (queued / running / succeeded / failed), payload JSONB, attempts (incremented at claim), max_attempts (total, including the first), run_at, locked_by, locked_at, lease_expires_at, started_at, finished_at, last_error, dedupe_key, created_at, updated_at. CHECK constraints: valid status; `0 <= attempts <= max_attempts`, `max_attempts >= 1`; `running` requires `locked_by`, `locked_at`, `lease_expires_at` and `started_at`; every other status requires `locked_by`, `locked_at` and `lease_expires_at` to be NULL; `finished_at` is set exactly when the status is `succeeded` or `failed` |
 | `job_schedules` | name (PK), job_type, interval_seconds (CHECK > 0), payload JSONB, enabled (removed schedules are disabled, not deleted), next_run_at, last_enqueued_at, created_at, updated_at |
 
@@ -311,10 +457,11 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 
 ### 10.6 Indexing
 - Foreign keys indexed.
-- `traces (project_id, started_at)`, `spans (trace_id)`, `prediction_logs (model_version_id, timestamp)`, `users (email)` unique, `refresh_tokens (token_hash)` unique, `refresh_tokens (family_id)`.
+- `traces (project_id, started_at)`, `spans (trace_id)`, `prediction_logs (model_version_id, timestamp)`, `users (email)` unique, `refresh_tokens (token_hash)` unique, `refresh_tokens (family_id)`, `refresh_tokens (user_id)`, `refresh_tokens (replaced_by_id)` unique.
 - Jobs: `jobs (run_at, created_at) WHERE status = 'queued'` (claiming), `jobs (lease_expires_at) WHERE status = 'running'` (recovery), `jobs (type, status)`, `jobs (finished_at)`, and a partial unique index `jobs (dedupe_key) WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'running')` (active deduplication). `job_schedules (next_run_at) WHERE enabled` (due schedules).
 - `incidents (project_id, status, last_seen_at)`, `incidents (project_id, fingerprint)`, `incidents (resolved_at)`, `investigation_reports (project_id, updated_at)`, `investigation_report_items (report_id, kind)`, `investigation_report_revisions (report_id, revision)` unique.
-- A partial unique index on `project_members (project_id) WHERE role = 'owner'` enforces a single Owner.
+- A partial unique index on `project_members (project_id) WHERE role = 'owner'` enforces a single Owner. It cannot be deferred, so an ownership transfer demotes the old Owner before promoting the new one.
+- Projects: `project_members (user_id)` (a user's projects; `project_id` is the primary key's leading column), `api_keys (key_hash)` unique (resolving a presented key), `api_keys (project_id)` (listing a project's keys), `api_keys (created_by)` and `api_keys (revoked_by)` (foreign keys; keep `SET NULL` from scanning on user deletion).
 - Retention deletes rely on the time indexes above. Partitioning of `spans` and `prediction_logs` by time is deferred until data volume requires it.
 
 ## 11. Cross-Cutting Concerns
@@ -322,7 +469,7 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 - **Configuration:** environment variables, loaded once in `core/config` via Pydantic settings (database URL, JWT and CSRF signing secrets, access/refresh token lifetimes, cookie settings including SameSite policy, allowed origins, storage root, retention defaults per data type, incident detector defaults, investigation drafting provider/model and prompt version, worker poll interval).
 - **Errors:** domain exceptions mapped to consistent JSON error responses.
 - **Logging:** structured logs; prompts, responses, passwords, tokens, and keys are never logged by default.
-- **Testing:** Pytest against PostgreSQL in Docker with Alembic-applied schema; fake LLM provider; temporary directory for storage; CI on GitHub Actions.
+- **Testing:** Pytest against PostgreSQL in Docker with Alembic-applied schema (implemented); fake LLM provider, temporary directory for storage, and CI on GitHub Actions (planned).
 
 ## 12. Decisions
 
@@ -345,6 +492,9 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 | D15 | Evidence snapshots | Report evidence is copied into the report and immutable, independent of source-data retention. Confirmed. |
 | D16 | AI-assisted investigations | An LLM may draft hypotheses and recommended actions via `providers`. Every AI item must cite snapshot evidence; AI hypotheses are always `proposed`; only users confirm root causes. Users edit and approve reports; all generations and updates are recorded as revisions (§5.4). |
 | D17 | Notifications | Email, Slack, and webhook notifications are excluded from the initial implementation; post-M9 consideration. |
+| D18 | Project membership | There are no invitations (D17). Owners and Admins add **existing registered users by email**; this reveals to them whether an email has an account (accepted). Admins may manage other Admins and Members, including demoting themselves, but never the Owner. Members and Admins may leave a project. The Owner can neither leave nor be removed and must transfer ownership first. Non-members get 404 for a project, as if it did not exist. Confirmed. |
+| D19 | Ownership transfer | Only the Owner transfers ownership, to an existing active member of the same project. The previous Owner becomes an **Admin** (keeps management rights, loses deletion and transfer). Confirmed. |
+| D20 | API key security | Keys are `tiq_` plus 32 bytes (256 bits) from a cryptographically secure generator. Only the SHA-256 digest is stored, with no pepper: 256 random bits cannot be brute-forced. The full key is shown once, in the creation response (`Cache-Control: no-store`), and can never be retrieved again; neither the key nor its hash is ever returned afterwards. At most 25 active keys per project; revoked keys don't count. Revocation is immediate and permanent, and revoked keys are kept for audit and never authenticate. Only Owners and Admins create, list and revoke keys (§7.3). Confirmed. |
 
 ### Remaining open decisions
 | Topic | Notes |

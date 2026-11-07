@@ -125,6 +125,32 @@ def test_engine_hides_sql_parameters() -> None:
     assert get_engine().hide_parameters is True
 
 
+def test_request_sessions_use_read_committed() -> None:
+    """Authorization re-checks under a row lock depend on it (see core/database.get_engine)."""
+    session_gen = get_db()
+    session = next(session_gen)
+    try:
+        assert session.scalar(text("SHOW transaction_isolation")) == "read committed"
+        assert session.connection().get_isolation_level() == "READ COMMITTED"
+    finally:
+        session_gen.close()
+
+
+def test_read_committed_is_set_explicitly_not_inherited() -> None:
+    """A server or role default of REPEATABLE READ must not leak into application sessions."""
+    session_gen = get_db()
+    session = next(session_gen)
+    try:
+        session.execute(text("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        session.commit()
+        # The engine sets the level at the start of every transaction on this connection.
+        assert session.scalar(text("SHOW transaction_isolation")) == "read committed"
+    finally:
+        session.execute(text("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+        session.commit()
+        session_gen.close()
+
+
 def test_database_error_does_not_contain_parameter_values() -> None:
     exc = _database_error_with_sensitive_parameter()
 
@@ -136,7 +162,8 @@ def test_formatted_database_error_hides_parameters_but_keeps_diagnostics() -> No
     message = format_error(_database_error_with_sensitive_parameter())
 
     assert SENSITIVE_VALUE not in message
-    # Still useful: exception type, the database's message, and the SQL text.
-    assert message.startswith("DataError: (psycopg.errors.DivisionByZero) division by zero")
-    assert "[SQL: SELECT %(value)s WHERE 1 / 0 = 1]" in message
-    assert "[SQL parameters hidden due to hide_parameters=True]" in message
+    # Database messages can embed row values, so only safe diagnostics remain: the exception
+    # type, the driver error class and the SQLSTATE.
+    assert message == (
+        "DataError: <database error message redacted> db_error_type=DivisionByZero sqlstate=22012 constraint=None"
+    )

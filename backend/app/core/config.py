@@ -3,9 +3,33 @@
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, Field, PositiveFloat, PositiveInt, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy import URL, make_url
+
+# Signing secrets must be at least this many bytes; generate one with
+# `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+MIN_AUTH_SECRET_BYTES = 32
+# A secret with fewer distinct characters than this cannot be 32 random bytes in any common encoding.
+_MIN_SECRET_DISTINCT_CHARS = 10
+_PLACEHOLDER_MARKERS = ("change-me", "changeme", "replace-me", "replaceme", "example")
+
+# Bounds for every retention period, in days: the configured defaults and per-project overrides.
+MIN_RETENTION_DAYS = 1
+MAX_RETENTION_DAYS = 3650
+
+
+class AuthConfigurationError(RuntimeError):
+    """Authentication secrets are missing or too weak. The message never contains secret values."""
 
 
 class Settings(BaseSettings):
@@ -52,6 +76,53 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: PositiveFloat = 1.0
     worker_maintenance_interval_seconds: PositiveFloat = 15.0
 
+    # Authentication. Secrets are optional here so that processes which do not authenticate (the
+    # worker) start without them; the API checks them at startup with validate_auth_secrets().
+    # Browser origins allowed for Origin validation are TRACEIQ_CORS_ORIGINS.
+    jwt_secret: SecretStr | None = None
+    csrf_secret: SecretStr | None = None
+    jwt_issuer: str = "traceiq"
+    jwt_audience: str = "traceiq-api"
+    # Allowed clock skew when validating token timestamps.
+    jwt_leeway_seconds: NonNegativeInt = Field(10, le=300)
+    access_token_ttl_seconds: PositiveInt = 15 * 60
+    # Rolling lifetime of each refresh token; every rotation issues a new one.
+    refresh_token_ttl_seconds: PositiveInt = 7 * 24 * 3600
+    # Absolute lifetime of a refresh-token family (session), regardless of rotation.
+    refresh_token_absolute_ttl_seconds: PositiveInt = 30 * 24 * 3600
+    auth_cookie_secure: bool = True
+    auth_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    auth_cookie_domain: str | None = None
+    # None means: enabled in development and test, disabled in production.
+    auth_registration_enabled: bool | None = None
+    # Process-wide cap on simultaneous Argon2id operations (each uses 64 MiB). Read once per process.
+    auth_max_concurrent_hashes: int = Field(4, ge=1, le=64)
+    # How long a request waits for a hashing slot before failing with 503 (overload protection).
+    auth_hash_wait_timeout_seconds: float = Field(10.0, gt=0, le=120)
+
+    # Retention defaults in days (D7). Projects may override them within the same bounds; modules
+    # read them from here and never hard-code periods. Model artifacts have no setting: they are
+    # kept until manually deleted. Unresolved incidents are never deleted.
+    retention_traces_days: int = Field(30, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    retention_evaluation_results_days: int = Field(90, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    retention_prediction_logs_days: int = Field(30, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    # Counted from the incident's resolution.
+    retention_incidents_days_after_resolution: int = Field(180, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS)
+    # Counted from the report's last update.
+    retention_investigation_reports_days_after_update: int = Field(
+        180, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS
+    )
+
+    @field_validator("jwt_secret", "csrf_secret", "auth_cookie_domain", "auth_registration_enabled", mode="before")
+    @classmethod
+    def _empty_is_unset(cls, value: object) -> object:
+        return None if value == "" else value
+
+    @field_validator("auth_cookie_samesite", mode="before")
+    @classmethod
+    def _normalize_samesite(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
@@ -74,6 +145,55 @@ class Settings(BaseSettings):
         if self.job_backoff_max_seconds < self.job_backoff_base_seconds:
             raise ValueError("job_backoff_max_seconds must be greater than or equal to job_backoff_base_seconds")
         return self
+
+    @model_validator(mode="after")
+    def _check_auth_settings(self) -> "Settings":
+        if self.refresh_token_absolute_ttl_seconds < self.refresh_token_ttl_seconds:
+            raise ValueError("refresh_token_absolute_ttl_seconds must be >= refresh_token_ttl_seconds")
+        if self.access_token_ttl_seconds > self.refresh_token_ttl_seconds:
+            raise ValueError("access_token_ttl_seconds must be <= refresh_token_ttl_seconds")
+        if self.auth_cookie_samesite == "none" and not self.auth_cookie_secure:
+            raise ValueError("auth_cookie_samesite='none' requires auth_cookie_secure=true")
+        if self.env == "production" and not self.auth_cookie_secure:
+            raise ValueError("auth_cookie_secure must be true in production")
+        return self
+
+    @property
+    def registration_enabled(self) -> bool:
+        if self.auth_registration_enabled is not None:
+            return self.auth_registration_enabled
+        return self.env != "production"
+
+    def validate_auth_secrets(self) -> None:
+        """Raise ``AuthConfigurationError`` unless both signing secrets are present and strong.
+
+        Called by the API at startup. Checks: present, at least ``MIN_AUTH_SECRET_BYTES`` bytes,
+        not an obvious placeholder or low-variety value, and the two secrets differ.
+        """
+        problems: list[str] = []
+        values: dict[str, str] = {}
+        for name in ("jwt_secret", "csrf_secret"):
+            secret: SecretStr | None = getattr(self, name)
+            variable = f"TRACEIQ_{name.upper()}"
+            if secret is None:
+                problems.append(f"{variable} is not set")
+                continue
+            value = secret.get_secret_value()
+            values[name] = value
+            if len(value.encode("utf-8")) < MIN_AUTH_SECRET_BYTES:
+                problems.append(f"{variable} must be at least {MIN_AUTH_SECRET_BYTES} bytes")
+            elif len(set(value)) < _MIN_SECRET_DISTINCT_CHARS or any(
+                marker in value.lower() for marker in _PLACEHOLDER_MARKERS
+            ):
+                problems.append(f"{variable} looks like a placeholder or non-random value")
+        if len(values) == 2 and values["jwt_secret"] == values["csrf_secret"]:
+            problems.append("TRACEIQ_JWT_SECRET and TRACEIQ_CSRF_SECRET must be different")
+        if problems:
+            raise AuthConfigurationError(
+                "Invalid authentication configuration: "
+                + "; ".join(problems)
+                + ". Generate each secret with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+            )
 
     @property
     def sqlalchemy_url(self) -> URL:

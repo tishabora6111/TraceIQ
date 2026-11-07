@@ -494,10 +494,11 @@ def test_database_error_parameters_and_payload_never_reach_logs_or_last_error(
         result = make_worker(registry).run_once()
 
     assert result is not None and result[1] is JobOutcome.RETRY_SCHEDULED
-    # Useful diagnostics are kept in the stored error...
+    # Safe diagnostics are kept in the stored error (database messages themselves are redacted)...
     last_error = job_row(job_id).last_error
-    assert last_error.startswith("DataError: (psycopg.errors.DivisionByZero) division by zero")
-    assert "[SQL parameters hidden due to hide_parameters=True]" in last_error
+    assert last_error == (
+        "DataError: <database error message redacted> db_error_type=DivisionByZero sqlstate=22012 constraint=None"
+    )
     # ...but the value appears nowhere: not in last_error, messages, structured fields, or tracebacks.
     assert SENSITIVE_VALUE not in last_error
     formatter = logging.Formatter()

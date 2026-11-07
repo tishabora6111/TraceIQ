@@ -1,6 +1,6 @@
 # TraceIQ – Product Requirements Document
 
-**Status:** Approved for development · **Implementation status:** No features implemented yet
+**Status:** Approved for development · **Implementation status:** M1 – Foundation in progress (platform foundations: authentication, projects and roles, API-key management, retention settings, background jobs). The product features below are not implemented yet; see [ROADMAP.md](ROADMAP.md).
 
 ## 1. Overview
 
@@ -116,6 +116,7 @@ All features below are **Planned**.
 | Trace and evaluation operations | ✓ | ✓ | ✓ |
 | Incident and investigation report access (including AI drafting, editing, and approval) | ✓ | ✓ | ✓ |
 | Project settings (retention, API keys, detector thresholds) | ✓ | ✓ | — |
+| View retention settings | ✓ | ✓ | ✓ |
 | Member management | ✓ | ✓ | — |
 | Delete project | ✓ | — | — |
 | Transfer ownership | ✓ | — | — |
