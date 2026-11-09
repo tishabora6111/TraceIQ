@@ -41,7 +41,7 @@ Milestones are delivered in order. LLM/RAG observability comes first; traditiona
 
 **Exit criteria:** API, worker, and database start locally with Docker; CI green; a user can sign in, refresh, and log out; a reused refresh token is rejected and its family revoked; requests without a valid CSRF token or allowed Origin are rejected; each role is limited to its permissions; a project and API key can be created; a test job runs, fails, and is retried.
 
-**Remaining for M1:** `core/storage` and CI. The other criteria are met by the test suite; the Docker start-up with migration `0004_projects` is still to be re-verified.
+**Remaining for M1:** `core/storage` and CI. The other criteria are met: by the test suite, and for the Docker start-up with migration `0004_projects` by an isolated Docker Compose smoke test and the development deployment (database migrated to `0004_projects`, API and worker started).
 
 ## M2 – LLM Tracing ⬜
 - `tracing` module: traces, spans, retrieved documents.
