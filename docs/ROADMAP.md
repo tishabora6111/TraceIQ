@@ -7,7 +7,7 @@ Milestones are delivered in order. LLM/RAG observability comes first; traditiona
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Project documentation | ✅ |
-| M1 | Foundation | ⬜ |
+| M1 | Foundation | 🟡 |
 | M2 | LLM tracing | ⬜ |
 | M3 | Provider abstraction and cost analytics | ⬜ |
 | M4 | RAG evaluation | ⬜ |
@@ -23,22 +23,25 @@ Milestones are delivered in order. LLM/RAG observability comes first; traditiona
 ## M0 – Project Documentation ✅
 - CLAUDE.md, PRD, architecture, roadmap, README.
 
-## M1 – Foundation ⬜
-- Backend skeleton: FastAPI app factory, `core` (config, DB session, errors, logging), health endpoint.
-- Frontend skeleton: Vite + React + TypeScript + Tailwind.
-- PostgreSQL via Docker Compose; Alembic migration environment.
-- `jobs` module and separate worker process: job table, statuses, retries with backoff, stale-job recovery, recurring scheduling.
-- `auth` module:
+## M1 – Foundation 🟡
+- ✅ Backend skeleton: FastAPI app factory, `core` (config, DB session, errors, logging), health endpoint.
+- ✅ Frontend skeleton: Vite + React + TypeScript + Tailwind.
+- ✅ PostgreSQL via Docker Compose; Alembic migration environment.
+- ✅ `jobs` module and separate worker process: job table, statuses, retries with backoff, stale-job recovery, recurring scheduling.
+- ✅ `auth` module:
   - users and email/password login (Argon2id via pwdlib);
   - access-token issuance and validation (PyJWT, 15 minutes);
   - refresh-token rotation and server-side revocation (7 days, reuse detection, logout);
   - refresh cookie (HttpOnly, Secure, SameSite=Lax, restricted path);
   - CSRF protection: signed double-submit token in `X-CSRF-Token`, Origin validation.
-- `projects` module: projects, memberships, role-based authorization (Owner, Admin, Member) including ownership transfer, hashed API keys, retention settings.
-- `core/storage`: storage abstraction with local filesystem implementation.
-- Pytest setup with PostgreSQL; GitHub Actions CI (lint + tests).
+- ✅ `projects` module (M1.4): projects, memberships, role-based authorization (Owner, Admin, Member) including ownership transfer, hashed API keys (create, list, revoke; ingestion authentication arrives with M2), retention settings. Migration `0004_projects`.
+- ⬜ `core/storage`: storage abstraction with local filesystem implementation.
+- ✅ Pytest setup with PostgreSQL.
+- ⬜ GitHub Actions CI (lint + tests); no linter is configured yet.
 
 **Exit criteria:** API, worker, and database start locally with Docker; CI green; a user can sign in, refresh, and log out; a reused refresh token is rejected and its family revoked; requests without a valid CSRF token or allowed Origin are rejected; each role is limited to its permissions; a project and API key can be created; a test job runs, fails, and is retried.
+
+**Remaining for M1:** `core/storage` and CI. The other criteria are met: by the test suite, and for the Docker start-up with migration `0004_projects` by an isolated Docker Compose smoke test and the development deployment (database migrated to `0004_projects`, API and worker started).
 
 ## M2 – LLM Tracing ⬜
 - `tracing` module: traces, spans, retrieved documents.

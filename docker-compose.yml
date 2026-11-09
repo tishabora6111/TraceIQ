@@ -57,7 +57,22 @@ services:
 
   api:
     <<: *backend-image
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      # Authentication: API only (the worker and migrate never receive the signing secrets).
+      # Empty secrets make the API refuse to start with an explanatory error; other services still start.
+      TRACEIQ_JWT_SECRET: ${TRACEIQ_JWT_SECRET:-}
+      TRACEIQ_CSRF_SECRET: ${TRACEIQ_CSRF_SECRET:-}
+      TRACEIQ_AUTH_COOKIE_SECURE: ${TRACEIQ_AUTH_COOKIE_SECURE:-true}
+      TRACEIQ_AUTH_COOKIE_SAMESITE: ${TRACEIQ_AUTH_COOKIE_SAMESITE:-lax}
+      TRACEIQ_AUTH_COOKIE_DOMAIN: ${TRACEIQ_AUTH_COOKIE_DOMAIN:-}
+      # Empty: enabled in development, disabled in production.
+      TRACEIQ_AUTH_REGISTRATION_ENABLED: ${TRACEIQ_AUTH_REGISTRATION_ENABLED:-}
+      TRACEIQ_AUTH_MAX_CONCURRENT_HASHES: ${TRACEIQ_AUTH_MAX_CONCURRENT_HASHES:-4}
+      TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS: ${TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS:-10}
+      TRACEIQ_ACCESS_TOKEN_TTL_SECONDS: ${TRACEIQ_ACCESS_TOKEN_TTL_SECONDS:-900}
+      TRACEIQ_REFRESH_TOKEN_TTL_SECONDS: ${TRACEIQ_REFRESH_TOKEN_TTL_SECONDS:-604800}
+      TRACEIQ_REFRESH_TOKEN_ABSOLUTE_TTL_SECONDS: ${TRACEIQ_REFRESH_TOKEN_ABSOLUTE_TTL_SECONDS:-2592000}
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:

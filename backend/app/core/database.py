@@ -36,6 +36,11 @@ def get_engine() -> Engine:
         # Keep SQL parameter values (which may hold payload or user data) out of exception
         # messages, and therefore out of stored job errors and logs. The SQL text is kept.
         hide_parameters=True,
+        # Required, not just PostgreSQL's default: writes re-check authorization after taking a row
+        # lock (SELECT ... FOR UPDATE) in a transaction that already read the caller's role. Under
+        # READ COMMITTED each statement sees the latest committed data, so that re-check is current;
+        # under REPEATABLE READ it would read the transaction's stale snapshot (ARCHITECTURE §7.3).
+        isolation_level="READ COMMITTED",
     )
 
 
