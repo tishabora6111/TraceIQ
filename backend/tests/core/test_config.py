@@ -4,7 +4,13 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import make_url
 
-from app.core.config import MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, AuthConfigurationError, Settings
+from app.core.config import (
+    DEFAULT_STORAGE_ROOT,
+    MAX_RETENTION_DAYS,
+    MIN_RETENTION_DAYS,
+    AuthConfigurationError,
+    Settings,
+)
 
 RESERVED_PASSWORD = "p@ss:w/rd#50%?&=+ $x"
 
@@ -24,9 +30,11 @@ DB_ENV_VARS = (
 
 
 @pytest.fixture(autouse=True)
-def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in DB_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    # Production requires an absolute storage root; storage tests below remove it again.
+    monkeypatch.setenv("TRACEIQ_STORAGE_ROOT", str(tmp_path / "storage"))
 
 
 def make_settings(**values: object) -> Settings:
@@ -479,3 +487,82 @@ def test_max_concurrent_hashes_out_of_range_from_the_environment(monkeypatch: py
 
     with pytest.raises(ValidationError, match="auth_max_concurrent_hashes"):
         make_settings()
+
+
+@pytest.fixture
+def _no_storage_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TRACEIQ_STORAGE_ROOT", raising=False)
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+@pytest.mark.parametrize("env", ["development", "test"])
+def test_storage_root_defaults_to_relative_data_directory_outside_production(env: str) -> None:
+    assert make_settings(env=env).storage_root == DEFAULT_STORAGE_ROOT == Path("data/storage")
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+def test_storage_root_read_from_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TRACEIQ_STORAGE_ROOT", str(tmp_path / "files"))
+
+    assert make_settings().storage_root == tmp_path / "files"
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+def test_empty_storage_root_means_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Docker Compose passes unset variables as empty strings."""
+    monkeypatch.setenv("TRACEIQ_STORAGE_ROOT", "")
+
+    assert make_settings().storage_root == DEFAULT_STORAGE_ROOT
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+def test_production_requires_storage_root() -> None:
+    with pytest.raises(ValidationError, match="storage_root must be an absolute path in production"):
+        make_settings(env="production")
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+@pytest.mark.parametrize("root", ["data/storage", "./storage", "storage", "../storage", ""])
+def test_production_rejects_relative_storage_root(monkeypatch: pytest.MonkeyPatch, root: str) -> None:
+    monkeypatch.setenv("TRACEIQ_ENV", "production")
+    monkeypatch.setenv("TRACEIQ_STORAGE_ROOT", root)
+
+    with pytest.raises(ValidationError, match="storage_root must be an absolute path in production") as raised:
+        make_settings()
+    assert "TRACEIQ_STORAGE_ROOT" in str(raised.value)
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+def test_production_accepts_absolute_storage_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TRACEIQ_ENV", "production")
+    monkeypatch.setenv("TRACEIQ_STORAGE_ROOT", str(tmp_path))
+
+    assert make_settings().storage_root == tmp_path
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+def test_storage_root_rejects_nul() -> None:
+    with pytest.raises(ValidationError, match="storage_root must not contain NUL"):
+        make_settings(storage_root="data/\x00storage")
+
+
+@pytest.mark.usefixtures("_no_storage_env")
+def test_storage_root_error_does_not_expose_other_settings() -> None:
+    """The storage-root check is a field validator, so its error shows only the rejected value,
+    never the rest of the settings input (which a model-level error would echo)."""
+    password_marker = "db-password-marker-Q7wXz"
+    jwt_marker = "jwt-secret-marker-K3vRt-0123456789abcdef"
+
+    with pytest.raises(ValidationError, match="storage_root must be an absolute path in production") as raised:
+        make_settings(
+            env="production",
+            storage_root="relative/storage",
+            database_password=password_marker,
+            jwt_secret=jwt_marker,
+            database_url=f"postgresql+psycopg://user:{password_marker}@db/traceiq",
+        )
+
+    rendered = str(raised.value) + repr(raised.value.errors())
+    assert password_marker not in rendered
+    assert jwt_marker not in rendered
+    assert "relative/storage" in rendered  # only the rejected value itself is shown

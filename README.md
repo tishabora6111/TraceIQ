@@ -4,7 +4,7 @@
 
 TraceIQ gives engineering teams visibility into LLM applications, RAG pipelines, and machine learning models in production: trace every step, measure quality, track cost, and detect drift — in one place.
 
-> **Project status: early development (M1 – Foundation in progress).** Implemented and tested: the backend and worker skeleton, background jobs, authentication (sign-in, refresh-token rotation, CSRF and Origin protection), and projects with roles, ownership transfer, retention settings and API-key management. Still outstanding in M1: the storage abstraction and CI. The observability features below are not implemented yet; trace ingestion, the first use of API keys, arrives in M2. See the [roadmap](docs/ROADMAP.md).
+> **Project status: early development (M1 – Foundation in progress).** Implemented and tested: the backend and worker skeleton, background jobs, authentication (sign-in, refresh-token rotation, CSRF and Origin protection), and projects with roles, ownership transfer, retention settings and API-key management, and the file storage abstraction. Still outstanding in M1: CI. The observability features below are not implemented yet; trace ingestion, the first use of API keys, arrives in M2. See the [roadmap](docs/ROADMAP.md).
 
 ## Features
 
@@ -81,6 +81,16 @@ All settings are in `.env.example` and are passed only to the `api` service.
 | `TRACEIQ_AUTH_HASH_WAIT_TIMEOUT_SECONDS` | `10` | How long a login waits for hashing capacity before returning 503. |
 
 The auth endpoints are under `/api/v1/auth`: `register`, `login`, `refresh`, `logout` and `me`. Details are in [docs/ARCHITECTURE.md §7](docs/ARCHITECTURE.md).
+
+### Storage configuration
+Files such as reference datasets and model artifacts are stored on the local filesystem through `core/storage`, never in PostgreSQL. No module stores files yet; the first will be ML monitoring (M6).
+
+- `TRACEIQ_STORAGE_ROOT` is the storage directory. Outside production it defaults to `data/storage`, relative to the backend's working directory (git-ignored). In production it must be an absolute path; otherwise the API, worker and `migrate` refuse to start.
+- Under Docker Compose it is always `/data/storage`, the mount point of the named volume `storage-data`. The `api` and `worker` services share that volume, so both see the same files, and the files persist when containers are recreated. `docker compose down` removes containers and networks but keeps named volumes, so stored files survive it.
+- **Warning:** `docker compose down -v` also removes the named volumes: `storage-data`, which holds every stored file, **and** `postgres-data`, which holds the PostgreSQL database. Running it permanently deletes both your stored files and your database contents.
+- `TRACEIQ_STORAGE_ROOT` is not in `.env.example`, and Compose sets it directly, so setting it in `.env` has no effect under Docker. It takes effect only when the backend runs outside Docker.
+
+Details are in [docs/ARCHITECTURE.md §9](docs/ARCHITECTURE.md).
 
 ### Projects API
 Projects are under `/api/v1/projects`. Every request needs a bearer access token, and every write also needs an allowed Origin.

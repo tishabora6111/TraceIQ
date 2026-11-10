@@ -15,6 +15,8 @@ COPY alembic.ini ./
 COPY alembic ./alembic
 
 RUN useradd --create-home --uid 1000 traceiq
+# File storage root (TRACEIQ_STORAGE_ROOT). A new named volume mounted here copies this ownership.
+RUN mkdir -p /data/storage && chown traceiq:traceiq /data/storage && chmod 0750 /data/storage
 USER traceiq
 
 EXPOSE 8000
