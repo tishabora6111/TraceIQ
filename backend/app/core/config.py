@@ -1,6 +1,7 @@
 """Application configuration loaded from environment variables."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -10,6 +11,7 @@ from pydantic import (
     PositiveFloat,
     PositiveInt,
     SecretStr,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -26,6 +28,9 @@ _PLACEHOLDER_MARKERS = ("change-me", "changeme", "replace-me", "replaceme", "exa
 # Bounds for every retention period, in days: the configured defaults and per-project overrides.
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 3650
+
+# File storage root outside production, relative to the working directory (git-ignored `data/`).
+DEFAULT_STORAGE_ROOT = Path("data/storage")
 
 
 class AuthConfigurationError(RuntimeError):
@@ -113,6 +118,10 @@ class Settings(BaseSettings):
         180, ge=MIN_RETENTION_DAYS, le=MAX_RETENTION_DAYS
     )
 
+    # Root directory of file storage (core/storage). Production requires an absolute path; a
+    # relative one resolves against the working directory, so it is allowed only outside production.
+    storage_root: Path = Field(DEFAULT_STORAGE_ROOT, validate_default=True)
+
     @field_validator("jwt_secret", "csrf_secret", "auth_cookie_domain", "auth_registration_enabled", mode="before")
     @classmethod
     def _empty_is_unset(cls, value: object) -> object:
@@ -139,6 +148,24 @@ class Settings(BaseSettings):
     @classmethod
     def _empty_url_is_unset(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("storage_root", mode="before")
+    @classmethod
+    def _check_storage_root_value(cls, value: object) -> object:
+        # Docker Compose passes unset variables as empty strings: use the default.
+        if value == "":
+            return DEFAULT_STORAGE_ROOT
+        if isinstance(value, str) and "\x00" in value:
+            raise ValueError("storage_root must not contain NUL characters")
+        return value
+
+    @field_validator("storage_root")
+    @classmethod
+    def _check_storage_root(cls, value: Path, info: ValidationInfo) -> Path:
+        # A field validator, so a validation error shows only this (relative) value, never other settings.
+        if info.data.get("env") == "production" and not value.is_absolute():
+            raise ValueError("storage_root must be an absolute path in production (set TRACEIQ_STORAGE_ROOT)")
+        return value
 
     @model_validator(mode="after")
     def _check_backoff_bounds(self) -> "Settings":

@@ -35,13 +35,13 @@ Milestones are delivered in order. LLM/RAG observability comes first; traditiona
   - refresh cookie (HttpOnly, Secure, SameSite=Lax, restricted path);
   - CSRF protection: signed double-submit token in `X-CSRF-Token`, Origin validation.
 - ✅ `projects` module (M1.4): projects, memberships, role-based authorization (Owner, Admin, Member) including ownership transfer, hashed API keys (create, list, revoke; ingestion authentication arrives with M2), retention settings. Migration `0004_projects`.
-- ⬜ `core/storage`: storage abstraction with local filesystem implementation.
+- ✅ `core/storage`: storage abstraction with local filesystem implementation (`LocalFileStorage`, `local:///` URIs); `storage-data` Docker volume shared by API and worker.
 - ✅ Pytest setup with PostgreSQL.
 - ⬜ GitHub Actions CI (lint + tests); no linter is configured yet.
 
 **Exit criteria:** API, worker, and database start locally with Docker; CI green; a user can sign in, refresh, and log out; a reused refresh token is rejected and its family revoked; requests without a valid CSRF token or allowed Origin are rejected; each role is limited to its permissions; a project and API key can be created; a test job runs, fails, and is retried.
 
-**Remaining for M1:** `core/storage` and CI. The other criteria are met: by the test suite, and for the Docker start-up with migration `0004_projects` by an isolated Docker Compose smoke test and the development deployment (database migrated to `0004_projects`, API and worker started).
+**Remaining for M1:** CI. The other criteria are met: by the test suite, and for the Docker start-up with migration `0004_projects` by an isolated Docker Compose smoke test and the development deployment (database migrated to `0004_projects`, API and worker started). Storage is covered by its tests and by an isolated Docker Compose smoke test in production mode (API and worker save and read each other's files on the shared volume, and the files survive container recreation).
 
 ## M2 – LLM Tracing ⬜
 - `tracing` module: traces, spans, retrieved documents.
