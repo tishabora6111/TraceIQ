@@ -1,6 +1,6 @@
 # TraceIQ – Architecture
 
-**Status:** Approved design · **Implementation status:** M1 – Foundation in progress. Implemented: `core` (including storage, §9), `health`, `jobs` and the worker, `auth`, `projects`. Planned: CI and every later module. Sections say where they describe implemented behaviour.
+**Status:** Approved design · **Implementation status:** M1 – Foundation in progress. Implemented: `core` (including storage, §9), `health`, `jobs` and the worker, `auth`, `projects`. In progress: CI (§11; the workflow exists and awaits its first successful run). Planned: every later module. Sections say where they describe implemented behaviour.
 
 ## 1. Architectural Style
 
@@ -42,13 +42,13 @@ TraceIQ is a **modular monolith**: one backend codebase and one database, intern
 | Analytics / ML | scikit-learn, SciPy, XGBoost, SHAP | Metrics, drift tests, explanations |
 | Frontend | React, TypeScript, Vite, Tailwind CSS, Recharts | Dashboard UI and charts |
 | Packaging | Docker | Local and deployment runtime |
-| CI | GitHub Actions, Pytest | Tests and checks on every PR |
+| CI | GitHub Actions, Pytest | Tests, builds and Compose validation on pull requests to `main` and pushes to `main` |
 
 No Redis, Celery, or message broker is used initially; PostgreSQL serves as the job queue.
 
 ## 3. Repository Layout
 
-Target layout. Present today: `main.py`, `worker.py`, `core/`, `modules/auth`, `modules/health`, `modules/jobs`, `modules/projects`, `alembic/`, `tests/`, and the frontend skeleton. The other modules, `sdk/` and `.github/workflows/` are planned.
+Target layout. Present today: `main.py`, `worker.py`, `core/`, `modules/auth`, `modules/health`, `modules/jobs`, `modules/projects`, `alembic/`, `tests/`, the frontend skeleton and `.github/workflows/ci.yml`. The other modules and `sdk/` are planned.
 
 ```
 backend/
@@ -485,7 +485,13 @@ PostgreSQL, single schema, managed with Alembic. UUID primary keys; `created_at`
 - **Configuration:** environment variables, loaded once in `core/config` via Pydantic settings (database URL, JWT and CSRF signing secrets, access/refresh token lifetimes, cookie settings including SameSite policy, allowed origins, storage root, retention defaults per data type, incident detector defaults, investigation drafting provider/model and prompt version, worker poll interval).
 - **Errors:** domain exceptions mapped to consistent JSON error responses.
 - **Logging:** structured logs; prompts, responses, passwords, tokens, and keys are never logged by default.
-- **Testing:** Pytest against PostgreSQL in Docker with Alembic-applied schema, and temporary directories for storage (implemented); fake LLM provider and CI on GitHub Actions (planned).
+- **Testing:** Pytest against PostgreSQL in Docker with Alembic-applied schema, and temporary directories for storage (implemented); fake LLM provider (planned).
+- **CI** (in progress: the workflow exists and becomes implemented after its first successful run on GitHub): GitHub Actions workflow `.github/workflows/ci.yml`, run on pull requests to `main` and pushes to `main`. Three independent jobs run in parallel on GitHub-hosted Ubuntu runners:
+  - **Backend:** Python 3.11; installs `./backend[dev]` and runs the full Pytest suite against a `postgres:16-alpine` service container. The test fixtures create and migrate the `_test` database themselves, and `TRACEIQ_TEST_REQUIRE_DB=1` makes database tests fail instead of skipping when PostgreSQL is unreachable.
+  - **Frontend:** Node 22; `npm ci`, `npm test` (Vitest) and `npm run build`, which includes the TypeScript check.
+  - **Docker:** validates `docker-compose.yml` (`docker compose config`) and builds the backend and frontend images without starting any container.
+
+  The workflow token is read-only (`contents: read`), no secrets are used (database credentials are CI-only dummies), actions are pinned to full commit SHAs, every job has a timeout, and a newer run for the same pull request or branch cancels the older one. Not checked yet: linting (no linter is configured) and Alembic migration drift; both are deferred. Requiring these checks before merging into `main` (branch protection) is a repository setting, configured on GitHub.
 
 ## 12. Decisions
 

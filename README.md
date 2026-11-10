@@ -4,7 +4,7 @@
 
 TraceIQ gives engineering teams visibility into LLM applications, RAG pipelines, and machine learning models in production: trace every step, measure quality, track cost, and detect drift — in one place.
 
-> **Project status: early development (M1 – Foundation in progress).** Implemented and tested: the backend and worker skeleton, background jobs, authentication (sign-in, refresh-token rotation, CSRF and Origin protection), and projects with roles, ownership transfer, retention settings and API-key management, and the file storage abstraction. Still outstanding in M1: CI. The observability features below are not implemented yet; trace ingestion, the first use of API keys, arrives in M2. See the [roadmap](docs/ROADMAP.md).
+> **Project status: early development (M1 – Foundation in progress).** Implemented and tested: the backend and worker skeleton, background jobs, authentication (sign-in, refresh-token rotation, CSRF and Origin protection), and projects with roles, ownership transfer, retention settings and API-key management, and the file storage abstraction. Still outstanding in M1: CI, whose workflow is written and awaits its first successful run. The observability features below are not implemented yet; trace ingestion, the first use of API keys, arrives in M2. See the [roadmap](docs/ROADMAP.md).
 
 ## Features
 
@@ -130,6 +130,16 @@ API keys will authenticate ingestion clients once the ingestion API exists (M2);
 - **Revocation** is immediate and permanent. Revoked keys stay listed with `is_active: false`.
 - **Limit:** 25 active keys per project; revoked keys don't count.
 - Members can't see or manage keys. Key names are trimmed and must be 1–100 characters.
+
+## Continuous Integration
+
+GitHub Actions runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on pull requests to `main` and pushes to `main`, in three parallel jobs:
+
+- **Backend:** the full Pytest suite on Python 3.11 against a PostgreSQL 16 service container. Database tests fail rather than skip if PostgreSQL is unavailable.
+- **Frontend:** `npm ci`, `npm test` and `npm run build` (including the TypeScript check) on Node 22.
+- **Docker:** validates `docker-compose.yml` and builds the backend and frontend images.
+
+CI uses no secrets and a read-only token. No linter is configured yet. The workflow has not run on GitHub yet; see the [roadmap](docs/ROADMAP.md).
 
 ## Documentation
 
